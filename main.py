@@ -1,4 +1,4 @@
-async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):import os
+import os
 import logging
 import sqlite3
 from datetime import datetime
@@ -462,6 +462,7 @@ I-type ang `/start` para magsimula!
             """
         
         await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
+    
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Ban a user (Admin only)"""
         if update.effective_user.id != ADMIN_ID:
@@ -478,17 +479,7 @@ I-type ang `/start` para magsimula!
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
     
-    async def list_chats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List all chats where bot is active (Admin only)"""
-        if update.effective_user.id != ADMIN_ID:
-            return
-            
-        # This is a simple implementation - for full chat listing, you'd need to store chat info in database
-        await update.message.reply_text(
-            "📊 **Active Chats**\n\nPara sa detailed chat list, i-check ang bot logs.\n\n" +
-            "**Note:** Bot is purely private messaging - walang public posts sa channels/groups.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show stats (Admin only)"""
         if update.effective_user.id != ADMIN_ID:
             return
@@ -512,6 +503,18 @@ I-type ang `/start` para magsimula!
         """
         
         await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
+    
+    async def list_chats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all chats where bot is active (Admin only)"""
+        if update.effective_user.id != ADMIN_ID:
+            return
+            
+        # This is a simple implementation - for full chat listing, you'd need to store chat info in database
+        await update.message.reply_text(
+            "📊 **Active Chats**\n\nPara sa detailed chat list, i-check ang bot logs.\n\n" +
+            "**Note:** Bot is purely private messaging - walang public posts sa channels/groups.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 def main():
     """Main function"""
@@ -535,8 +538,6 @@ def main():
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
     application.add_handler(CommandHandler("chats", bot_manager.list_chats_command))
-    
-    # Removed the problematic test command line
     
     logger.info("🇵🇭 Filipino Verification Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
