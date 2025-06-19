@@ -12,7 +12,7 @@ from phonenumbers import NumberParseException
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, 
-    ChatMemberUpdated, ChatPermissions, KeyboardButton, ReplyKeyboardMarkup
+    ChatMemberUpdated, ChatPermissions, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatMemberHandler,
@@ -27,36 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration - Use environment variables for security with default values
+# Configuration - Use environment variables for security
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
-
-# Optional environment variables with defaults
-REQUIRED_CHANNEL_ID = os.getenv('REQUIRED_CHANNEL_ID')
-if REQUIRED_CHANNEL_ID:
-    try:
-        REQUIRED_CHANNEL_ID = int(REQUIRED_CHANNEL_ID)
-    except ValueError:
-        logger.error(f"Invalid REQUIRED_CHANNEL_ID: {REQUIRED_CHANNEL_ID}. Must be a number.")
-        REQUIRED_CHANNEL_ID = None
-else:
-    REQUIRED_CHANNEL_ID = None
-
-# Filipino language patterns
-FILIPINO_PATTERNS = [
-    r'\b(ako|ikaw|siya|kami|kayo|sila)\b',
-    r'\b(ang|ng|sa|si|ni|kay)\b',
-    r'\b(mga|mga|naman|lang|din|rin)\b',
-    r'\b(kumusta|salamat|oo|hindi|hindi|opo)\b',
-    r'\b(magandang|umaga|hapon|gabi)\b',
-    r'\b(pano|paano|saan|kelan|bakit)\b',
-    r'\b(tayo|natin|namin|ninyo|nila)\b',
-    r'\b(pwede|pwedi|kaya|siguro|baka)\b',
-    r'\b(yung|nung|dun|dito|dyan)\b',
-    r'\b(pre|bro|kuya|ate|tito|tita)\b'
-]
-
-FILIPINO_REGEX = re.compile('|'.join(FILIPINO_PATTERNS), re.IGNORECASE)
 
 @dataclass
 class UserData:
@@ -89,8 +62,6 @@ class DatabaseManager:
                 verification_status TEXT DEFAULT 'pending',
                 strike_count INTEGER DEFAULT 0,
                 is_whitelisted BOOLEAN DEFAULT FALSE,
-                language_score INTEGER DEFAULT 0,
-                timezone_score INTEGER DEFAULT 0,
                 last_activity TIMESTAMP
             )
         ''')
@@ -102,19 +73,7 @@ class DatabaseManager:
                 username TEXT,
                 ban_reason TEXT,
                 ban_date TIMESTAMP,
-                banned_by INTEGER,
-                appeal_count INTEGER DEFAULT 0
-            )
-        ''')
-        
-        # Chat settings table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS chat_settings (
-                chat_id INTEGER PRIMARY KEY,
-                strict_mode BOOLEAN DEFAULT TRUE,
-                grace_period INTEGER DEFAULT 48,
-                max_strikes INTEGER DEFAULT 3,
-                auto_ban BOOLEAN DEFAULT TRUE
+                banned_by INTEGER
             )
         ''')
         
@@ -200,7 +159,7 @@ class DatabaseManager:
         conn.commit()
         conn.close()
 
-class FilipinoVerifier:
+class PhoneVerifier:
     @staticmethod
     def verify_phone_number(phone_number: str) -> Dict[str, any]:
         """Verify if phone number is from Philippines"""
@@ -215,59 +174,15 @@ class FilipinoVerifier:
                 'is_filipino': is_ph,
                 'country_code': country_code,
                 'region': region,
-                'confidence': 0.9 if is_ph else 0.1
+                'formatted_number': phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
             }
         except NumberParseException:
             return {
                 'is_filipino': False,
                 'country_code': None,
                 'region': None,
-                'confidence': 0.0
+                'formatted_number': phone_number
             }
-    
-    @staticmethod
-    def analyze_language(text: str) -> Dict[str, any]:
-        """Analyze text for Filipino language patterns"""
-        if not text:
-            return {'is_filipino': False, 'confidence': 0.0, 'matched_patterns': []}
-        
-        text_lower = text.lower()
-        matches = FILIPINO_REGEX.findall(text_lower)
-        
-        # Calculate confidence based on Filipino word density
-        words = re.findall(r'\b\w+\b', text_lower)
-        filipino_words = len(matches)
-        total_words = len(words)
-        
-        if total_words == 0:
-            confidence = 0.0
-        else:
-            confidence = min(filipino_words / total_words * 2, 1.0)  # Scale to max 1.0
-        
-        return {
-            'is_filipino': confidence > 0.3,
-            'confidence': confidence,
-            'matched_patterns': matches,
-            'filipino_word_count': filipino_words,
-            'total_words': total_words
-        }
-    
-    @staticmethod
-    def analyze_timezone_activity(user_id: int, db: DatabaseManager) -> Dict[str, any]:
-        """Analyze user activity patterns for Philippine timezone"""
-        # This is a simplified version - in production you'd track activity over time
-        current_hour = datetime.now().hour
-        
-        # Philippine time is UTC+8, so active hours would be different
-        ph_active_hours = list(range(6, 24))  # 6 AM to 11 PM PH time
-        
-        is_ph_timezone = current_hour in ph_active_hours
-        
-        return {
-            'is_filipino_timezone': is_ph_timezone,
-            'confidence': 0.6 if is_ph_timezone else 0.3,
-            'current_hour': current_hour
-        }
 
 class FilipinoBotManager:
     def __init__(self):
@@ -277,8 +192,7 @@ class FilipinoBotManager:
             raise ValueError("ADMIN_ID environment variable is required!")
             
         self.db = DatabaseManager()
-        self.verifier = FilipinoVerifier()
-        self.pending_verifications = {}  # Store users in grace period
+        self.verifier = PhoneVerifier()
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -287,12 +201,11 @@ class FilipinoBotManager:
         welcome_message = f"""
 🇵🇭 *Maligayang pagdating sa Filipino Verification Bot!*
 
-Ako ay tumutulong na ma-verify ang mga tunay na Filipino users para sa secure na community.
+Simple lang ang process dito - I-share mo lang ang phone number mo para ma-verify na Filipino user ka.
 
 *Mga Commands:*
-• `/verify` - Manual verification request
+• `/verify` - I-verify ang sarili mo
 • `/status` - Check verification status
-• `/appeal` - Appeal a ban (if banned)
 • `/help` - Show all commands
 
 *Admin Commands:*
@@ -316,22 +229,20 @@ Salamat sa paggamit ng bot! 🚀
 
 *User Commands:*
 • `/start` - Welcome message
-• `/verify` - Request manual verification
-• `/status` - Check your verification status
-• `/appeal` - Appeal a ban
+• `/verify` - I-verify ang sarili mo gamit ang PH phone number
+• `/status` - Check verification status
 
-*How Verification Works:*
-1. Phone number verification (PH +63)
-2. Language analysis (Filipino/Tagalog)
-3. Activity pattern analysis
-4. Manual review if needed
+*Paano gumana ang verification:*
+1. I-click ang `/verify` command
+2. I-click ang "📱 Share Phone Number" button
+3. Automatic ma-ve-verify kung PH number (+63)
+4. Tapos na! 🎉
 
 *Admin Commands:*
 • `/stats` - View bot statistics
 • `/whitelist <user_id>` - Add to whitelist
 • `/ban <user_id> <reason>` - Manual ban
 • `/unban <user_id>` - Remove ban
-• `/logs` - View activity logs
 
 Para sa mga tanong, makipag-ugnayan sa admin.
         """
@@ -341,22 +252,243 @@ Para sa mga tanong, makipag-ugnayan sa admin.
     async def verify_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /verify command"""
         user = update.effective_user
-        chat_id = update.effective_chat.id
         
         # Check if user is already verified
         user_data = self.db.get_user(user.id)
         if user_data and user_data.verification_status == "verified":
             await update.message.reply_text(
-                "✅ You are already verified! No need to verify again.",
+                "✅ *Na-verify ka na!*\n\nHindi mo na kailangan mag-verify ulit. Welcome sa community! 🇵🇭",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
         
-        # Start verification process
-        await self.start_verification_process(user, chat_id, context)
+        # Check if banned
+        if self.db.is_banned(user.id):
+            await update.message.reply_text(
+                "🚫 *Banned ka sa bot na ito.*\n\nContact the admin kung may appeal ka.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Start phone verification
+        await self.start_phone_verification(update, context)
+    
+    async def start_phone_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start phone number verification process"""
+        user = update.effective_user
+        
+        # Create user record if not exists
+        user_data = self.db.get_user(user.id)
+        if not user_data:
+            user_data = UserData(
+                user_id=user.id,
+                username=user.username or "",
+                first_name=user.first_name or "",
+                phone_number="",
+                join_date=datetime.now(),
+                verification_status="pending",
+                strike_count=0,
+                is_whitelisted=False
+            )
+            self.db.add_user(user_data)
+        
+        # Create contact sharing keyboard
+        contact_keyboard = [[KeyboardButton("📱 I-Share ang Phone Number Ko", request_contact=True)]]
+        contact_markup = ReplyKeyboardMarkup(
+            contact_keyboard, 
+            one_time_keyboard=True, 
+            resize_keyboard=True
+        )
+        
+        verification_msg = f"""
+🇵🇭 *Philippine Phone Number Verification*
+
+Hi {user.first_name}! Para ma-verify ka, kailangan mo lang i-share ang phone number mo.
+
+**Important:**
+• Dapat Philippine number (+63) ang gagamitin mo
+• Automatic ma-de-detect kung PH number or hindi
+• Secure ito - hindi makikita ng iba ang number mo
+• One-click lang, tapos na!
+
+👇 *I-click ang button sa baba para ma-share ang phone number mo:*
+        """
+        
+        await update.message.reply_text(
+            verification_msg,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=contact_markup
+        )
+    
+    async def handle_contact_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle phone number sharing - SECURE VERSION"""
+        if not update.message.contact:
+            return
+        
+        contact = update.message.contact
+        user_id = update.effective_user.id
+        
+        # SECURITY CHECK: Ensure user can only verify their own number
+        if contact.user_id != user_id:
+            await update.message.reply_text(
+                "❌ **Security Error!**\n\n"
+                "Sariling phone number mo lang ang pwedeng i-verify!\n"
+                "Hindi pwedeng mag-verify ng number ng iba.\n\n"
+                "Please share your own contact.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+        
+        # Remove keyboard after contact sharing
+        await update.message.reply_text(
+            "📱 Ini-process ang phone number mo...",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # Verify phone number
+        phone_result = self.verifier.verify_phone_number(contact.phone_number)
+        
+        if phone_result['is_filipino']:
+            # SUCCESS - Update user data
+            user_data = self.db.get_user(user_id)
+            if user_data:
+                user_data.phone_number = contact.phone_number
+                user_data.verification_status = "verified"
+                user_data.strike_count = 0  # Reset strikes on successful verification
+                self.db.add_user(user_data)
+                
+                success_msg = f"""
+✅ **Phone Number Verified Successfully!**
+
+🇵🇭 **Philippine Number Confirmed**
+• Number: {phone_result['formatted_number']}
+• Country: Philippines 🇵🇭
+• Status: **VERIFIED** ✅
+
+**🎉 Welcome to the community!** 
+
+Hindi mo na kailangan mag-verify ulit sa ibang groups/channels na may same bot.
+
+Salamat sa pagiging verified Filipino user! 🚀
+
+*Pwede mo na mag-enjoy sa lahat ng features ng community!*
+                """
+                
+                await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN)
+                self.db.log_activity(user_id, "verified", f"PH phone verified: {contact.phone_number}")
+                
+                # Notify admin of successful verification
+                try:
+                    admin_msg = f"""
+✅ *New Verified User*
+
+**User:** {user_data.first_name} (@{user_data.username or 'no_username'})
+**User ID:** `{user_id}`
+**Phone:** {phone_result['formatted_number']}
+**Status:** Verified ✅
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.MARKDOWN)
+                except Exception as e:
+                    logger.error(f"Error notifying admin: {e}")
+        else:
+            # FAILED - Add strike and handle accordingly
+            self.db.add_strike(user_id)
+            user_data = self.db.get_user(user_id)
+            strikes = user_data.strike_count if user_data else 1
+            
+            country_name = phone_result.get('region', 'Unknown')
+            if country_name == 'Unknown':
+                country_name = "Hindi ma-identify ang bansa"
+            
+            fail_msg = f"""
+❌ **Phone Number Verification Failed**
+
+**Nakitang Issue:**
+• Number: {phone_result['formatted_number']}
+• Country: {country_name}
+• Expected: Philippines 🇵🇭 (+63)
+
+**Strike Added:** {strikes}/3
+
+{'⚠️ **Warning:** Isa pa lang, automatic ban na!' if strikes == 2 else ''}
+
+**Ano ang pwede mong gawin:**
+• Gamitin ang totoong Philippine number mo
+• Siguraduhing naka-register sa Telegram ang PH number mo
+• Contact admin kung may problema
+
+**Bakit need ng PH number?**
+Para ma-ensure na Filipino users lang ang nasa community.
+            """
+            
+            if strikes >= 3:
+                # Auto-ban user
+                self.db.ban_user(user_id, user_data.username if user_data else "", "3 strikes - Non-PH phone attempts", 0)
+                fail_msg += "\n\n🚫 **BANNED:** Sobrang daming failed attempts na. Contact admin para sa appeal."
+                
+                # Notify admin of ban
+                try:
+                    admin_msg = f"""
+🚫 *User Auto-Banned*
+
+**User:** {user_data.first_name if user_data else 'Unknown'} (@{user_data.username if user_data and user_data.username else 'no_username'})
+**User ID:** `{user_id}`
+**Reason:** 3 strikes - Multiple non-PH phone attempts
+**Last Number:** {phone_result['formatted_number']} ({country_name})
+**Status:** Auto-banned 🚫
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.MARKDOWN)
+                except Exception as e:
+                    logger.error(f"Error notifying admin about ban: {e}")
+            
+            await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
+            self.db.log_activity(user_id, "strike", f"Non-PH phone: {contact.phone_number} ({country_name})")
+    
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Check user verification status"""
+        user = update.effective_user
+        user_data = self.db.get_user(user.id)
+        
+        if not user_data:
+            status_msg = """
+ℹ️ **Status: Hindi pa nag-start ang verification**
+
+Para mag-start, i-type lang ang `/verify`
+            """
+        elif self.db.is_banned(user.id):
+            status_msg = """
+🚫 **Status: BANNED**
+
+Banned ka sa bot na ito. Contact admin para sa appeal.
+            """
+        elif user_data.verification_status == "verified":
+            status_msg = f"""
+✅ **Status: VERIFIED** 🇵🇭
+
+**User Details:**
+• Name: {user_data.first_name}
+• Phone: {user_data.phone_number}
+• Verified Date: {user_data.join_date.strftime('%Y-%m-%d %H:%M')}
+
+**Congratulations!** Verified Filipino user ka! 🎉
+            """
+        else:
+            status_msg = f"""
+⏳ **Status: PENDING VERIFICATION**
+
+**Current Details:**
+• Name: {user_data.first_name}
+• Strikes: {user_data.strike_count}/3
+• Join Date: {user_data.join_date.strftime('%Y-%m-%d %H:%M')}
+
+Para ma-verify, i-type ang `/verify`
+            """
+        
+        await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
     
     async def verify_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Verify new chat members"""
+        """Auto-verify new chat members"""
         if not update.chat_member or not update.chat_member.new_chat_member:
             return
         
@@ -373,422 +505,246 @@ Para sa mga tanong, makipag-ugnayan sa admin.
                 await context.bot.ban_chat_member(chat_id, new_member.id)
                 await context.bot.send_message(
                     chat_id, 
-                    f"❌ User {new_member.first_name} is banned from this community."
+                    f"🚫 User {new_member.first_name} is banned from this community."
                 )
                 return
             except Exception as e:
                 logger.error(f"Error banning user {new_member.id}: {e}")
         
-        # Start verification process
-        await self.start_verification_process(new_member, chat_id, context)
-    
-    async def start_verification_process(self, user, chat_id, context):
-        """Start the verification process for a new user"""
-        user_data = UserData(
-            user_id=user.id,
-            username=user.username or "",
-            first_name=user.first_name or "",
-            phone_number="",
-            join_date=datetime.now(),
-            verification_status="pending",
-            strike_count=0,
-            is_whitelisted=False
-        )
-        
-        self.db.add_user(user_data)
-        self.db.log_activity(user.id, "joined", f"Joined chat {chat_id}")
-        
-        # Send verification message
-        keyboard = [
-            [InlineKeyboardButton("📱 Verify Phone Number", callback_data=f"verify_phone_{user.id}")],
-            [InlineKeyboardButton("💬 Filipino Language Test", callback_data=f"verify_lang_{user.id}")],
-            [InlineKeyboardButton("ℹ️ Manual Review", callback_data=f"manual_review_{user.id}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        welcome_msg = f"""
-🇵🇭 *Kumusta {user.first_name}!*
+        # Check if already verified
+        user_data = self.db.get_user(new_member.id)
+        if user_data and user_data.verification_status == "verified":
+            welcome_msg = f"""
+🇵🇭 Welcome {new_member.first_name}! 
 
-Para ma-verify ka sa community na ito, kailangan namin i-confirm na Filipino user ka.
+✅ **Already verified Filipino user** - Welcome sa community! 🎉
+            """
+            await context.bot.send_message(chat_id, welcome_msg)
+            return
+        
+        # Send verification message to new member
+        verification_msg = f"""
+🇵🇭 Hi {new_member.first_name}! Welcome sa group!
 
-*Mga paraan ng verification:*
-1. 📱 Phone number verification (PH +63)
-2. 💬 Filipino language test
-3. ℹ️ Manual review by admin
+Para ma-join officially sa community, kailangan mo ma-verify na Filipino user ka.
 
-Piliin ang isa sa mga options sa baba:
+**Simple lang ang process:**
+1. I-type ang `/verify` 
+2. I-click ang "Share Phone Number" button
+3. Tapos na! 🎉
+
+**Bakit need ng verification?**
+Para ma-ensure na Filipino community lang ito at safe para sa lahat.
+
+👇 *I-type ang /verify para mag-start:*
         """
         
         try:
+            await context.bot.send_message(new_member.id, verification_msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            # If can't send DM, send in group
             await context.bot.send_message(
                 chat_id, 
-                welcome_msg, 
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
+                f"{new_member.first_name}, please DM the bot and type `/verify` to get verified! 🇵🇭"
             )
-        except Exception as e:
-            logger.error(f"Error sending verification message: {e}")
     
-    async def handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle callback queries from inline keyboards"""
-        query = update.callback_query
-        await query.answer()
-        
-        data = query.data
-        user_id = query.from_user.id
-        
-        if data.startswith("verify_phone_"):
-            target_user_id = int(data.split("_")[2])
-            if user_id != target_user_id:
-                await query.edit_message_text("❌ You can only verify yourself!")
-                return
-            
-            # Create contact sharing keyboard
-            contact_keyboard = [[KeyboardButton("📱 Share My Phone Number", request_contact=True)]]
-            contact_markup = ReplyKeyboardMarkup(
-                contact_keyboard, 
-                one_time_keyboard=True, 
-                resize_keyboard=True
-            )
-            
-            await query.edit_message_text(
-                "📱 *Phone Number Verification*\n\n"
-                "Para ma-verify ang inyong Philippine phone number, i-click ang button sa baba. "
-                "Ang Telegram ay automatic na mag-s-send ng inyong real phone number.\n\n"
-                "🔒 **Security Note:** Hindi pwedeng mag-fake ng number dahil direct galing sa Telegram account mo.\n\n"
-                "👇 *Click the button below to share your contact:*",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # Send separate message with contact button
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text="👇 *I-click ang button para ma-send ang inyong phone number:*",
-                reply_markup=contact_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        
-        elif data.startswith("verify_lang_"):
-            target_user_id = int(data.split("_")[2])
-            if user_id != target_user_id:
-                await query.edit_message_text("❌ You can only verify yourself!")
-                return
-            
-            await self.start_language_test(query, target_user_id, context)
-        
-        elif data.startswith("manual_review_"):
-            target_user_id = int(data.split("_")[2])
-            if user_id != target_user_id:
-                await query.edit_message_text("❌ You can only verify yourself!")
-                return
-            
-            await self.request_manual_review(query, target_user_id, context)
-        
-        elif data.startswith("lang_answer_"):
-            # Handle language test answers
-            parts = data.split("_")
-            target_user_id = int(parts[2])
-            question_index = int(parts[3])
-            selected_answer = int(parts[4])
-            
-            if user_id != target_user_id:
-                await query.edit_message_text("❌ You can only answer your own test!")
-                return
-            
-            await self.handle_language_answer(query, target_user_id, question_index, selected_answer, context)
-    
-    async def start_language_test(self, query, user_id, context):
-        """Start Filipino language test"""
-        questions = [
-            {
-                "question": "Ano ang tawag sa umaga sa Filipino?",
-                "options": ["Morning", "Umaga", "Gabi", "Hapon"],
-                "correct": 1
-            },
-            {
-                "question": "Kumusta ka?",
-                "options": ["I'm fine", "Okay lang", "Good", "Nice"],
-                "correct": 1
-            },
-            {
-                "question": "Salamat' means:",
-                "options": ["Hello", "Goodbye", "Thank you", "Sorry"],
-                "correct": 2
-            }
-        ]
-        
-        # Store test data
-        self.pending_verifications[user_id] = {
-            "type": "language_test",
-            "questions": questions,
-            "current_question": 0,
-            "score": 0,
-            "start_time": datetime.now()
-        }
-        
-        await self.send_language_question(query, user_id, 0)
-    
-    async def send_language_question(self, query, user_id, question_index):
-        """Send a language test question"""
-        test_data = self.pending_verifications.get(user_id)
-        if not test_data or question_index >= len(test_data["questions"]):
+    # Admin Commands
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show bot statistics (Admin Only)"""
+        user_id = update.effective_user.id
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("❌ Admin command lang ito.")
             return
         
-        question = test_data["questions"][question_index]
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
         
-        keyboard = []
-        for i, option in enumerate(question["options"]):
-            keyboard.append([InlineKeyboardButton(
-                option, 
-                callback_data=f"lang_answer_{user_id}_{question_index}_{i}"
-            )])
+        # Get statistics
+        cursor.execute('SELECT COUNT(*) FROM users')
+        total_users = cursor.fetchone()[0]
         
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        cursor.execute('SELECT COUNT(*) FROM users WHERE verification_status = "verified"')
+        verified_users = cursor.fetchone()[0]
         
-        question_text = f"""
-🇵🇭 *Filipino Language Test*
+        cursor.execute('SELECT COUNT(*) FROM users WHERE verification_status = "pending"')
+        pending_users = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM banned_users')
+        banned_users = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM users WHERE is_whitelisted = TRUE')
+        whitelisted_users = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        stats_msg = f"""
+📊 **Bot Statistics**
 
-**Question {question_index + 1}/3:**
-{question["question"]}
+**Users:**
+• Total Users: {total_users}
+• ✅ Verified: {verified_users}
+• ⏳ Pending: {pending_users}
+• 🚫 Banned: {banned_users}
+• ⭐ Whitelisted: {whitelisted_users}
 
-Piliin ang tamang sagot:
+**Verification Rate:** {(verified_users/total_users*100):.1f}% kung may users na
         """
         
-        await query.edit_message_text(
-            question_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
     
-    async def request_manual_review(self, query, user_id, context):
-        """Request manual review from admin"""
-        await query.edit_message_text(
-            "ℹ️ *Manual Review Requested*\n\n"
-            "Ang inyong request ay naipadala na sa admin para sa manual review. "
-            "Maghintay lang ng approval.\n\n"
-            "Please wait for admin approval.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # Notify admin
-        try:
-            user = await context.bot.get_chat(user_id)
-            admin_msg = f"""
-🔍 *Manual Review Request*
-
-**User Details:**
-• Name: {user.first_name} {user.last_name or ''}
-• Username: @{user.username or 'None'}
-• User ID: `{user_id}`
-
-**Actions:**
-• `/approve {user_id}` - Approve user
-• `/reject {user_id}` - Reject user
-• `/whitelist {user_id}` - Add to whitelist
-            """
-            
-            await context.bot.send_message(
-                ADMIN_ID,
-                admin_msg,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            logger.error(f"Error notifying admin: {e}")
-    
-    async def handle_language_answer(self, query, user_id, question_index, selected_answer, context):
-        """Handle language test answers"""
-        test_data = self.pending_verifications.get(user_id)
-        if not test_data or test_data["type"] != "language_test":
-            await query.edit_message_text("❌ Test session expired. Please start again.")
-            return
-        
-        # Check if answer is correct
-        question = test_data["questions"][question_index]
-        is_correct = selected_answer == question["correct"]
-        
-        if is_correct:
-            test_data["score"] += 1
-        
-        # Move to next question or finish test
-        next_question = question_index + 1
-        test_data["current_question"] = next_question
-        
-        if next_question < len(test_data["questions"]):
-            # Show next question
-            await self.send_language_question(query, user_id, next_question)
-        else:
-            # Test completed
-            await self.complete_language_test(query, user_id, test_data, context)
-    
-    async def complete_language_test(self, query, user_id, test_data, context):
-        """Complete language test and show results"""
-        score = test_data["score"]
-        total = len(test_data["questions"])
-        percentage = (score / total) * 100
-        
-        # Remove from pending
-        if user_id in self.pending_verifications:
-            del self.pending_verifications[user_id]
-        
-        if percentage >= 66:  # Need at least 2/3 correct
-            # Update user status
-            user_data = self.db.get_user(user_id)
-            if user_data:
-                user_data.verification_status = "verified"
-                self.db.add_user(user_data)
-                
-                result_msg = f"""
-✅ *Language Test Passed!*
-
-**Results:**
-• Score: {score}/{total} ({percentage:.0f}%)
-• Status: **VERIFIED** 🇵🇭
-
-Congratulations! Welcome to the community!
-
-Hindi mo na kailangan mag-verify ulit. You're now a verified Filipino user!
-                """
-                
-                self.db.log_activity(user_id, "verified", f"Language test passed: {score}/{total}")
-        else:
-            # Failed test - add strike
-            self.db.add_strike(user_id)
-            user_data = self.db.get_user(user_id)
-            strikes = user_data.strike_count if user_data else 1
-            
-            result_msg = f"""
-❌ *Language Test Failed*
-
-**Results:**
-• Score: {score}/{total} ({percentage:.0f}%)
-• Required: 66% (2/3 correct)
-
-**Strike Added:** {strikes}/3
-
-{'⚠️ **Warning:** One more strike will result in automatic ban!' if strikes == 2 else ''}
-{'🚫 **BANNED:** Too many failed attempts!' if strikes >= 3 else ''}
-
-You can try other verification methods or request manual review.
-            """
-            
-            self.db.log_activity(user_id, "strike", f"Language test failed: {score}/{total}")
-            
-            # Auto-ban if too many strikes
-            if strikes >= 3:
-                await self.auto_ban_user(user_id, "Too many verification failures", context)
-        
-        await query.edit_message_text(result_msg, parse_mode=ParseMode.MARKDOWN)
-    
-    async def auto_ban_user(self, user_id, reason, context):
-        """Automatically ban user and notify admin"""
-        user_data = self.db.get_user(user_id)
-        username = user_data.username if user_data else "Unknown"
-        
-        self.db.ban_user(user_id, username, reason, 0)  # 0 = system ban
-        
-        # Notify admin
-        try:
-            admin_msg = f"""
-🚫 *Automatic Ban Executed*
-
-**User:** {username} (ID: `{user_id}`)
-**Reason:** {reason}
-**Action:** Automatic system ban
-
-User has been banned from all protected chats.
-            """
-            
-            await context.bot.send_message(
-                ADMIN_ID,
-                admin_msg,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            logger.error(f"Error notifying admin about auto-ban: {e}")
-    
-    async def handle_contact_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle phone number sharing - SECURE VERSION"""
-        if not update.message.contact:
-            return
-        
-        contact = update.message.contact
+    async def whitelist_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Whitelist a user (Admin Only)"""
         user_id = update.effective_user.id
-        
-        # SECURITY CHECK: Ensure user can only verify their own number
-        if contact.user_id != user_id:
-            await update.message.reply_text(
-                "❌ **Security Error!**\n\n"
-                "You can only verify your own phone number! "
-                "Hindi pwedeng mag-verify ng number ng iba.\n\n"
-                "Please share your own contact.",
-                parse_mode=ParseMode.MARKDOWN
-            )
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("❌ Admin command lang ito.")
             return
         
-        # Remove keyboard after contact sharing
-        from telegram import ReplyKeyboardRemove
-        await update.message.reply_text(
-            "📱 Processing your phone number...",
-            reply_markup=ReplyKeyboardRemove()
-        )
+        if not context.args:
+            await update.message.reply_text("Usage: `/whitelist <user_id>`", parse_mode=ParseMode.MARKDOWN)
+            return
         
-        # Verify phone number
-        phone_result = self.verifier.verify_phone_number(contact.phone_number)
-        
-        if phone_result['is_filipino']:
-            # Update user data
-            user_data = self.db.get_user(user_id)
-            if user_data:
-                user_data.phone_number = contact.phone_number
+        try:
+            target_user_id = int(context.args[0])
+            
+            # Get or create user
+            user_data = self.db.get_user(target_user_id)
+            if not user_data:
+                # Create new user record
+                try:
+                    target_user = await context.bot.get_chat(target_user_id)
+                    user_data = UserData(
+                        user_id=target_user_id,
+                        username=target_user.username or "",
+                        first_name=target_user.first_name or "",
+                        phone_number="",
+                        join_date=datetime.now(),
+                        verification_status="verified",
+                        strike_count=0,
+                        is_whitelisted=True
+                    )
+                except Exception as e:
+                    await update.message.reply_text(f"❌ Hindi ma-find ang user: {e}")
+                    return
+            else:
+                user_data.is_whitelisted = True
                 user_data.verification_status = "verified"
-                self.db.add_user(user_data)
-                
-                success_msg = f"""
-✅ **Phone Number Verified Successfully!**
-
-🇵🇭 **Philippine Number Confirmed**
-• Number: {contact.phone_number}
-• Country: Philippines (+63)
-• Status: **VERIFIED**
-
-**Welcome to the community!** 
-Hindi mo na kailangan mag-verify ulit sa ibang groups/channels na may same bot.
-
-Salamat sa pagiging verified Filipino user! 🚀
-                """
-                
-                await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN)
-                self.db.log_activity(user_id, "verified", f"PH phone verified: {contact.phone_number}")
-        else:
-            # Failed verification - add strike
-            self.db.add_strike(user_id)
-            user_data = self.db.get_user(user_id)
-            strikes = user_data.strike_count if user_data else 1
+                user_data.strike_count = 0
             
-            fail_msg = f"""
-❌ **Phone Number Verification Failed**
-
-**Issue Detected:**
-• Number: {contact.phone_number}
-• Country: {phone_result.get('region', 'Unknown')}
-• Expected: Philippines (+63)
-
-**Strike Added:** {strikes}/3
-
-{'⚠️ **Warning:** Dalawang strikes na lang, automatic ban na!' if strikes == 2 else ''}
-{'🚫 **BANNED:** Too many failed verification attempts!' if strikes >= 3 else ''}
-
-**What you can do:**
-• Use your real Philippine number
-• Try language verification
-• Request manual review
-            """
+            self.db.add_user(user_data)
+            self.db.log_activity(target_user_id, "whitelisted", f"Whitelisted by admin {user_id}")
             
-            await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
-            self.db.log_activity(user_id, "strike", f"Non-PH phone: {contact.phone_number} ({phone_result.get('region', 'Unknown')})")
+            await update.message.reply_text(
+                f"✅ User `{target_user_id}` has been whitelisted and verified!",
+                parse_mode=ParseMode.MARKDOWN
+            )
             
-            # Auto-ban if too many strikes
-            if strikes >= 3:
-                await self.auto_ban_user(user_id, "Multiple non-PH phone number attempts", context)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Dapat number lang.")
     
-    async
+    async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Ban a user (Admin Only)"""
+        user_id = update.effective_user.id
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("❌ Admin command lang ito.")
+            return
+        
+        if len(context.args) < 2:
+            await update.message.reply_text("Usage: `/ban <user_id> <reason>`", parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+            reason = " ".join(context.args[1:])
+            
+            # Get user info
+            user_data = self.db.get_user(target_user_id)
+            username = user_data.username if user_data else "Unknown"
+            
+            self.db.ban_user(target_user_id, username, reason, user_id)
+            self.db.log_activity(target_user_id, "banned", f"Banned by admin {user_id}: {reason}")
+            
+            await update.message.reply_text(
+                f"🚫 User `{target_user_id}` has been banned!\n**Reason:** {reason}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Dapat number lang.")
+    
+    async def unban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Unban a user (Admin Only)"""
+        user_id = update.effective_user.id
+        if user_id != ADMIN_ID:
+            await update.message.reply_text("❌ Admin command lang ito.")
+            return
+        
+        if not context.args:
+            await update.message.reply_text("Usage: `/unban <user_id>`", parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        try:
+            target_user_id = int(context.args[0])
+            
+            # Remove from banned users
+            conn = sqlite3.connect(self.db.db_path)
+            cursor = conn.cursor()
+            cursor.execute('DELETE FROM banned_users WHERE user_id = ?', (target_user_id,))
+            conn.commit()
+            conn.close()
+            
+            # Reset strikes
+            user_data = self.db.get_user(target_user_id)
+            if user_data:
+                user_data.strike_count = 0
+                self.db.add_user(user_data)
+            
+            self.db.log_activity(target_user_id, "unbanned", f"Unbanned by admin {user_id}")
+            
+            await update.message.reply_text(
+                f"✅ User `{target_user_id}` has been unbanned!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID. Dapat number lang.")
+
+def main():
+    """Main function to run the bot"""
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN environment variable is required!")
+        return
+    
+    if not ADMIN_ID:
+        logger.error("ADMIN_ID environment variable is required!")
+        return
+    
+    # Create bot manager
+    bot_manager = FilipinoBotManager()
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot_manager.start_command))
+    application.add_handler(CommandHandler("help", bot_manager.help_command))
+    application.add_handler(CommandHandler("verify", bot_manager.verify_command))
+    application.add_handler(CommandHandler("status", bot_manager.status_command))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("stats", bot_manager.stats_command))
+    application.add_handler(CommandHandler("whitelist", bot_manager.whitelist_command))
+    application.add_handler(CommandHandler("ban", bot_manager.ban_command))
+    application.add_handler(CommandHandler("unban", bot_manager.unban_command))
+    
+    # Contact handler for phone verification
+    application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
+    
+    # Chat member handler for new members
+    application.add_handler(ChatMemberHandler(bot_manager.verify_new_member, ChatMemberHandler.CHAT_MEMBER))
+    
+    # Start the bot
+    logger.info("🇵🇭 Filipino Verification Bot starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
