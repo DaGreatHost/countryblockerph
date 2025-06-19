@@ -457,8 +457,7 @@ def main():
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
     
-    # Add debug command for testing
-    application.add_handler(CommandHandler("test", bot_manager.test_command))
+    # Removed the problematic test command line
     
     logger.info("🇵🇭 Filipino Verification Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
