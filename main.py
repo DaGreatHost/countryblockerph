@@ -1,4 +1,4 @@
-import os
+async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):import os
 import logging
 import sqlite3
 from datetime import datetime
@@ -299,93 +299,60 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
             
             # Check if user is verified  
             if self.db.is_verified(user.id):
-                # Verified user - send welcome
+                # Verified user - send private welcome message only
                 try:
-                    welcome_msg = f"🇵🇭 Welcome {user.first_name}! Verified Filipino user ka na. 🎉"
-                    
-                    # For channels, try to send message
-                    if chat.type == 'channel':
-                        await context.bot.send_message(chat_id, welcome_msg)
-                    else:
-                        # For groups/supergroups
-                        await context.bot.send_message(chat_id, welcome_msg)
-                    
-                    logger.info(f"Welcomed verified user {user.id} in chat {chat_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Error welcoming user {user.id} in chat {chat_id}: {e}")
-            else:
-                # Unverified user - try private message first, then public reminder
-                private_message_sent = False
-                
-                # Try to send private verification message first
-                try:
-                    private_msg = f"""
-🇵🇭 **Hi {user.first_name}!**
+                    welcome_msg = f"""
+🇵🇭 **Welcome {user.first_name}!** ✅
 
-Nakita kong sumali ka sa **{chat.title or 'Filipino community'}**.
+Na-join ka na sa **{chat.title or 'Filipino Community'}** as verified Filipino user! 🎉
 
-Para ma-verify ka bilang Filipino user:
-👇 **I-type lang ang /start dito sa private chat**
-
-📱 **Verification process:**
-• I-share lang ang Philippine phone number mo
-• Automatic approval kapag verified
-• One-time verification lang para sa lahat ng Filipino groups
-
-**Bakit kailangan mag-verify?**
-• Protection ng community against non-Filipino users
-• Access sa exclusive Filipino channels/groups
-• Trusted member status
-
-I-click ang /start para magsimula! 🇵🇭
+✅ **Status:** Verified
+🛡️ **Access:** Full community privileges
                     """
                     
-                    await context.bot.send_message(user.id, private_msg, parse_mode=ParseMode.MARKDOWN)
-                    private_message_sent = True
-                    logger.info(f"✅ Sent private verification message to user {user.id}")
+                    await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Sent private welcome to verified user {user.id} for chat {chat_id}")
                     
                 except Exception as e:
-                    logger.info(f"❌ Could not send private message to user {user.id}: {e}")
-                    private_message_sent = False
-                
-                # If private message failed, send public reminder
-                if not private_message_sent:
-                    try:
-                        public_verify_msg = f"""
-🇵🇭 Hi {user.first_name}!
+                    logger.info(f"❌ Could not send private welcome to user {user.id}: {e}")
+                    # NO PUBLIC MESSAGE - Keep channel/group clean
+            else:
+                # Unverified user - PRIVATE MESSAGE ONLY
+                try:
+                    private_verification_msg = f"""
+🇵🇭 **Filipino Verification Required**
 
-Para ma-verify ka bilang Filipino user, i-message mo ako privately:
-👤 @{context.bot.username}
+Hi {user.first_name}! 
 
-Tapos i-type ang `/start` para mag-verify! 📱
+Nakita kong sumali ka sa:
+📢 **{chat.title or 'Filipino Community'}**
 
-*Verification required para sa Filipino community.*
-                        """
-                        
-                        if chat.type == 'channel':
-                            await context.bot.send_message(chat_id, public_verify_msg, parse_mode=ParseMode.MARKDOWN)
-                        else:
-                            await context.bot.send_message(chat_id, public_verify_msg, parse_mode=ParseMode.MARKDOWN)
-                        
-                        logger.info(f"📢 Sent public verification reminder for user {user.id} in chat {chat_id}")
-                        
-                    except Exception as e:
-                        logger.error(f"Error sending public verification reminder for user {user.id} in chat {chat_id}: {e}")
-                else:
-                    # Private message was sent successfully, send minimal public notice
-                    try:
-                        minimal_msg = f"🇵🇭 Welcome {user.first_name}! I-check ang private message mo para sa verification. 📱"
-                        
-                        if chat.type == 'channel':
-                            await context.bot.send_message(chat_id, minimal_msg)
-                        else:
-                            await context.bot.send_message(chat_id, minimal_msg)
-                        
-                        logger.info(f"📝 Sent minimal public notice for user {user.id} in chat {chat_id}")
-                        
-                    except Exception as e:
-                        logger.error(f"Error sending minimal public notice for user {user.id} in chat {chat_id}: {e}")
+Para ma-accept ka permanently sa channel/group na ito, kailangan mo ma-verify na Filipino user ka.
+
+📱 **Verification Process:**
+1. I-click ang /start dito sa private chat
+2. I-share ang Philippine phone number mo
+3. Automatic approval kapag verified na +63 number
+4. One-time verification lang para sa lahat ng Filipino groups
+
+🛡️ **Bakit kailangan mag-verify?**
+• Protection ng community against non-Filipino users
+• Access sa exclusive Filipino channels/groups
+• Trusted member status sa lahat ng Filipino communities
+
+**IMPORTANT:** Kung hindi ka mag-verify, maaaring ma-remove ka sa group/channel.
+
+👇 **I-click para magsimula:**
+/start
+                    """
+                    
+                    await context.bot.send_message(user.id, private_verification_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Sent private verification message to unverified user {user.id} for chat '{chat.title}' ({chat_id})")
+                    
+                except Exception as e:
+                    logger.warning(f"❌ Could not send private verification to user {user.id} for chat '{chat.title}': {e}")
+                    logger.warning("User might have disabled private messages from bots")
+                    # STILL NO PUBLIC MESSAGE - Keep it clean
                     
         except Exception as e:
             logger.error(f"Error in handle_chat_member_update: {e}")
@@ -403,26 +370,57 @@ Tapos i-type ang `/start` para mag-verify! 📱
             
             if new_status == ChatMemberStatus.ADMINISTRATOR:
                 logger.info(f"Bot became admin in chat {chat.id} ({chat.title})")
-                # Send setup message
-                setup_msg = """
-🇵🇭 **Filipino Verification Bot Active!**
-
-Bot is now set up sa channel/group na ito.
-
-**Features:**
-✅ Auto-welcome verified Filipino users
-📱 Auto-send verification reminders sa mga bagong members
-🚫 Protection against non-Filipino users
-
-**Setup Complete!** 🎉
-                """
+                # Send private setup confirmation to admin only - NO PUBLIC MESSAGE
                 try:
-                    await context.bot.send_message(chat.id, setup_msg, parse_mode=ParseMode.MARKDOWN)
-                except:
-                    pass  # Channel might not allow bot messages
+                    admin_setup_msg = f"""
+🇵🇭 **Bot Setup Complete!**
+
+Bot is now active sa:
+📢 **{chat.title}** (`{chat.id}`)
+
+**Features Enabled:**
+✅ Auto-detect new members
+📱 Private verification messages
+🛡️ No spam sa channel/group (pure private messaging)
+🎯 Force verification para sa Filipino users
+
+**How it works:**
+• New members = automatic private message
+• Verified users = private welcome
+• Unverified users = private verification request
+• Zero public messages sa group/channel
+
+**Bot Status:** Ready! 🚀
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_setup_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Sent private setup confirmation to admin for chat {chat.id}")
+                except Exception as e:
+                    logger.error(f"Error notifying admin about setup: {e}")
                     
             elif new_status == ChatMemberStatus.MEMBER:
                 logger.info(f"Bot added as member to chat {chat.id} ({chat.title})")
+                # Send private notification to admin - NO PUBLIC MESSAGE
+                try:
+                    member_setup_msg = f"""
+🇵🇭 **Bot Added as Member**
+
+Bot added sa:
+📢 **{chat.title}** (`{chat.id}`)
+
+**Status:** Member (Limited features)
+**Recommendation:** Make bot admin para sa full functionality
+
+**Current capabilities:**
+✅ Detect new members (kung may permission)
+📱 Send private messages
+⚠️ Limited chat member detection
+
+Para sa better performance, i-promote as admin ang bot.
+                    """
+                    await context.bot.send_message(ADMIN_ID, member_setup_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Sent member status notification to admin for chat {chat.id}")
+                except Exception as e:
+                    logger.error(f"Error notifying admin about member status: {e}")
                 
         except Exception as e:
             logger.error(f"Error in handle_my_chat_member_update: {e}")
@@ -480,7 +478,17 @@ I-type ang `/start` para magsimula!
         except ValueError:
             await update.message.reply_text("❌ Invalid user ID")
     
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def list_chats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all chats where bot is active (Admin only)"""
+        if update.effective_user.id != ADMIN_ID:
+            return
+            
+        # This is a simple implementation - for full chat listing, you'd need to store chat info in database
+        await update.message.reply_text(
+            "📊 **Active Chats**\n\nPara sa detailed chat list, i-check ang bot logs.\n\n" +
+            "**Note:** Bot is purely private messaging - walang public posts sa channels/groups.",
+            parse_mode=ParseMode.MARKDOWN
+        )
         """Show stats (Admin only)"""
         if update.effective_user.id != ADMIN_ID:
             return
@@ -526,6 +534,7 @@ def main():
     # Admin commands
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
+    application.add_handler(CommandHandler("chats", bot_manager.list_chats_command))
     
     # Removed the problematic test command line
     
