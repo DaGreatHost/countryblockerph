@@ -252,63 +252,147 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
             await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
     
     async def handle_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle new members joining chat"""
-        if not update.chat_member:
-            return
-            
-        chat_member_update = update.chat_member
-        new_member = chat_member_update.new_chat_member
-        old_member = chat_member_update.old_chat_member
-        
-        # Check if someone joined the chat
-        if (old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.KICKED] and 
-            new_member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED]):
-            
+        """Handle new members joining chat - Enhanced version"""
+        try:
+            if not update.chat_member:
+                logger.info("No chat_member in update")
+                return
+                
+            chat_member_update = update.chat_member
+            new_member = chat_member_update.new_chat_member
+            old_member = chat_member_update.old_chat_member
             user = new_member.user
             chat_id = update.effective_chat.id
+            chat = update.effective_chat
+            
+            logger.info(f"Chat member update: User {user.id} ({user.first_name}) in chat {chat_id}")
+            logger.info(f"Old status: {old_member.status}, New status: {new_member.status}")
             
             # Skip bots and admin
             if user.is_bot or user.id == ADMIN_ID:
+                logger.info(f"Skipping bot/admin user {user.id}")
+                return
+            
+            # Check various join scenarios
+            is_new_member = False
+            
+            # Scenario 1: User joined group/supergroup
+            if (old_member.status == ChatMemberStatus.LEFT and 
+                new_member.status == ChatMemberStatus.MEMBER):
+                is_new_member = True
+                logger.info(f"User {user.id} joined group {chat_id}")
+            
+            # Scenario 2: User was invited/added to channel
+            elif (old_member.status == ChatMemberStatus.LEFT and 
+                  new_member.status == ChatMemberStatus.RESTRICTED):
+                is_new_member = True
+                logger.info(f"User {user.id} added to channel {chat_id}")
+            
+            # Scenario 3: User approved to join (for approval-required groups)
+            elif (old_member.status == ChatMemberStatus.RESTRICTED and 
+                  new_member.status == ChatMemberStatus.MEMBER):
+                is_new_member = True
+                logger.info(f"User {user.id} approved in {chat_id}")
+            
+            if not is_new_member:
                 return
             
             # Check if user is verified  
             if self.db.is_verified(user.id):
-                # Auto-approve verified user
+                # Verified user - send welcome
                 try:
-                    # If this is a channel/group where bot is admin, 
-                    # the user should already be allowed in
                     welcome_msg = f"🇵🇭 Welcome {user.first_name}! Verified Filipino user ka na. 🎉"
-                    await context.bot.send_message(chat_id, welcome_msg)
-                    logger.info(f"Verified user {user.id} joined chat {chat_id}")
+                    
+                    # For channels, try to send message
+                    if chat.type == 'channel':
+                        await context.bot.send_message(chat_id, welcome_msg)
+                    else:
+                        # For groups/supergroups
+                        await context.bot.send_message(chat_id, welcome_msg)
+                    
+                    logger.info(f"Welcomed verified user {user.id} in chat {chat_id}")
+                    
                 except Exception as e:
-                    logger.error(f"Error welcoming verified user: {e}")
+                    logger.error(f"Error welcoming user {user.id} in chat {chat_id}: {e}")
             else:
-                # Send verification message
+                # Unverified user - send verification reminder
                 try:
+                    # Send message in the chat first
                     verify_msg = f"""
 🇵🇭 Hi {user.first_name}!
 
-Para ma-join sa community, kailangan mo ma-verify na Filipino user ka.
+Para ma-join permanently sa community, kailangan mo ma-verify na Filipino user ka.
 
-I-message lang ako privately at i-type ang `/start` para mag-verify! 👇
+I-message lang ako privately: @{context.bot.username}
+Tapos i-type ang `/start` para mag-verify! 👇
                     """
-                    await context.bot.send_message(chat_id, verify_msg)
                     
-                    # Also send private message if possible
+                    if chat.type == 'channel':
+                        await context.bot.send_message(chat_id, verify_msg)
+                    else:
+                        await context.bot.send_message(chat_id, verify_msg)
+                    
+                    # Try to send private message
                     try:
                         private_msg = f"""
 🇵🇭 Hi {user.first_name}!
 
-Kailangan mo ma-verify para sa Filipino community.
+Nakita kong sumali ka sa {chat.title or 'Filipino community'}.
 
-I-type lang ang `/start` dito para mag-start ng verification! 👇
+Para ma-verify ka bilang Filipino user:
+👇 I-type lang ang `/start` dito sa chat na ito
+
+Verification requirement lang ito para sa lahat ng Filipino channels/groups.
                         """
                         await context.bot.send_message(user.id, private_msg)
-                    except:
-                        pass  # User hasn't started bot yet
+                        logger.info(f"Sent private verification message to user {user.id}")
+                    except Exception as e:
+                        logger.info(f"Could not send private message to user {user.id}: {e}")
+                        
+                    logger.info(f"Sent verification reminder for user {user.id} in chat {chat_id}")
                         
                 except Exception as e:
-                    logger.error(f"Error handling new member: {e}")
+                    logger.error(f"Error handling unverified user {user.id} in chat {chat_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Error in handle_chat_member_update: {e}")
+            logger.error(f"Update: {update}")
+
+    async def handle_my_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle when bot is added/removed from chats"""
+        try:
+            if not update.my_chat_member:
+                return
+                
+            chat_member_update = update.my_chat_member
+            new_status = chat_member_update.new_chat_member.status
+            chat = update.effective_chat
+            
+            if new_status == ChatMemberStatus.ADMINISTRATOR:
+                logger.info(f"Bot became admin in chat {chat.id} ({chat.title})")
+                # Send setup message
+                setup_msg = """
+🇵🇭 **Filipino Verification Bot Active!**
+
+Bot is now set up sa channel/group na ito.
+
+**Features:**
+✅ Auto-welcome verified Filipino users
+📱 Auto-send verification reminders sa mga bagong members
+🚫 Protection against non-Filipino users
+
+**Setup Complete!** 🎉
+                """
+                try:
+                    await context.bot.send_message(chat.id, setup_msg, parse_mode=ParseMode.MARKDOWN)
+                except:
+                    pass  # Channel might not allow bot messages
+                    
+            elif new_status == ChatMemberStatus.MEMBER:
+                logger.info(f"Bot added as member to chat {chat.id} ({chat.title})")
+                
+        except Exception as e:
+            logger.error(f"Error in handle_my_chat_member_update: {e}")
     
     # Simple admin commands
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -364,11 +448,17 @@ def main():
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
+    
+    # Chat member handlers - BOTH are important!
     application.add_handler(ChatMemberHandler(bot_manager.handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     
     # Admin commands
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
+    
+    # Add debug command for testing
+    application.add_handler(CommandHandler("test", bot_manager.test_command))
     
     logger.info("🇵🇭 Filipino Verification Bot starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
