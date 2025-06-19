@@ -315,44 +315,77 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
                 except Exception as e:
                     logger.error(f"Error welcoming user {user.id} in chat {chat_id}: {e}")
             else:
-                # Unverified user - send verification reminder
+                # Unverified user - try private message first, then public reminder
+                private_message_sent = False
+                
+                # Try to send private verification message first
                 try:
-                    # Send message in the chat first
-                    verify_msg = f"""
-🇵🇭 Hi {user.first_name}!
+                    private_msg = f"""
+🇵🇭 **Hi {user.first_name}!**
 
-Para ma-join permanently sa community, kailangan mo ma-verify na Filipino user ka.
-
-I-message lang ako privately: @{context.bot.username}
-Tapos i-type ang `/start` para mag-verify! 👇
-                    """
-                    
-                    if chat.type == 'channel':
-                        await context.bot.send_message(chat_id, verify_msg)
-                    else:
-                        await context.bot.send_message(chat_id, verify_msg)
-                    
-                    # Try to send private message
-                    try:
-                        private_msg = f"""
-🇵🇭 Hi {user.first_name}!
-
-Nakita kong sumali ka sa {chat.title or 'Filipino community'}.
+Nakita kong sumali ka sa **{chat.title or 'Filipino community'}**.
 
 Para ma-verify ka bilang Filipino user:
-👇 I-type lang ang `/start` dito sa chat na ito
+👇 **I-type lang ang /start dito sa private chat**
 
-Verification requirement lang ito para sa lahat ng Filipino channels/groups.
-                        """
-                        await context.bot.send_message(user.id, private_msg)
-                        logger.info(f"Sent private verification message to user {user.id}")
-                    except Exception as e:
-                        logger.info(f"Could not send private message to user {user.id}: {e}")
-                        
-                    logger.info(f"Sent verification reminder for user {user.id} in chat {chat_id}")
-                        
+📱 **Verification process:**
+• I-share lang ang Philippine phone number mo
+• Automatic approval kapag verified
+• One-time verification lang para sa lahat ng Filipino groups
+
+**Bakit kailangan mag-verify?**
+• Protection ng community against non-Filipino users
+• Access sa exclusive Filipino channels/groups
+• Trusted member status
+
+I-click ang /start para magsimula! 🇵🇭
+                    """
+                    
+                    await context.bot.send_message(user.id, private_msg, parse_mode=ParseMode.MARKDOWN)
+                    private_message_sent = True
+                    logger.info(f"✅ Sent private verification message to user {user.id}")
+                    
                 except Exception as e:
-                    logger.error(f"Error handling unverified user {user.id} in chat {chat_id}: {e}")
+                    logger.info(f"❌ Could not send private message to user {user.id}: {e}")
+                    private_message_sent = False
+                
+                # If private message failed, send public reminder
+                if not private_message_sent:
+                    try:
+                        public_verify_msg = f"""
+🇵🇭 Hi {user.first_name}!
+
+Para ma-verify ka bilang Filipino user, i-message mo ako privately:
+👤 @{context.bot.username}
+
+Tapos i-type ang `/start` para mag-verify! 📱
+
+*Verification required para sa Filipino community.*
+                        """
+                        
+                        if chat.type == 'channel':
+                            await context.bot.send_message(chat_id, public_verify_msg, parse_mode=ParseMode.MARKDOWN)
+                        else:
+                            await context.bot.send_message(chat_id, public_verify_msg, parse_mode=ParseMode.MARKDOWN)
+                        
+                        logger.info(f"📢 Sent public verification reminder for user {user.id} in chat {chat_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error sending public verification reminder for user {user.id} in chat {chat_id}: {e}")
+                else:
+                    # Private message was sent successfully, send minimal public notice
+                    try:
+                        minimal_msg = f"🇵🇭 Welcome {user.first_name}! I-check ang private message mo para sa verification. 📱"
+                        
+                        if chat.type == 'channel':
+                            await context.bot.send_message(chat_id, minimal_msg)
+                        else:
+                            await context.bot.send_message(chat_id, minimal_msg)
+                        
+                        logger.info(f"📝 Sent minimal public notice for user {user.id} in chat {chat_id}")
+                        
+                    except Exception as e:
+                        logger.error(f"Error sending minimal public notice for user {user.id} in chat {chat_id}: {e}")
                     
         except Exception as e:
             logger.error(f"Error in handle_chat_member_update: {e}")
@@ -394,7 +427,43 @@ Bot is now set up sa channel/group na ito.
         except Exception as e:
             logger.error(f"Error in handle_my_chat_member_update: {e}")
     
-    # Simple admin commands
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Help command - Show verification instructions"""
+        user = update.effective_user
+        
+        if self.db.is_verified(user.id):
+            help_msg = """
+🇵🇭 **Na-verify ka na!** ✅
+
+**Available Commands:**
+• `/start` - Show verification status
+• `/help` - Show this help message
+
+**Your Status:** Verified Filipino User 🎉
+**Access:** All Filipino channels/groups available
+            """
+        else:
+            help_msg = """
+🇵🇭 **Filipino Verification Bot**
+
+**Para ma-verify:**
+1. I-type ang `/start` 
+2. I-click ang "Share Phone Number" button
+3. Automatic approval kapag Philippine number (+63)
+
+**Requirements:**
+📱 Valid Philippine mobile number
+🇵🇭 Must be from Philippines
+
+**Benefits:**
+✅ Access sa lahat ng Filipino channels/groups
+🛡️ Trusted member status
+🚀 One-time verification lang
+
+I-type ang `/start` para magsimula!
+            """
+        
+        await update.message.reply_text(help_msg, parse_mode=ParseMode.MARKDOWN)
     async def ban_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Ban a user (Admin only)"""
         if update.effective_user.id != ADMIN_ID:
@@ -447,6 +516,7 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_command))
+    application.add_handler(CommandHandler("help", bot_manager.help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
     
     # Chat member handlers - BOTH are important!
