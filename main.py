@@ -8,11 +8,11 @@ from phonenumbers import NumberParseException
 
 from telegram import (
     Update, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove,
-    ChatMemberUpdated, ChatMember
+    ChatMemberUpdated, ChatMember, ChatJoinRequest
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatMemberHandler,
-    ContextTypes, filters
+    ChatJoinRequestHandler, ContextTypes, filters
 )
 from telegram.constants import ChatMemberStatus, ParseMode
 
@@ -47,6 +47,17 @@ class DatabaseManager:
             )
         ''')
         
+        # Add table for join requests tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS join_requests (
+                user_id INTEGER,
+                chat_id INTEGER,
+                request_date TIMESTAMP,
+                status TEXT DEFAULT 'pending',
+                PRIMARY KEY (user_id, chat_id)
+            )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -73,6 +84,28 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('UPDATE verified_users SET is_banned = TRUE WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+    
+    def add_join_request(self, user_id: int, chat_id: int):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO join_requests 
+            (user_id, chat_id, request_date, status)
+            VALUES (?, ?, ?, 'pending')
+        ''', (user_id, chat_id, datetime.now()))
+        conn.commit()
+        conn.close()
+    
+    def update_join_request_status(self, user_id: int, chat_id: int, status: str):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE join_requests 
+            SET status = ? 
+            WHERE user_id = ? AND chat_id = ?
+        ''', (status, user_id, chat_id))
         conn.commit()
         conn.close()
 
@@ -130,13 +163,143 @@ class FilipinoBotManager:
         self.db = DatabaseManager()
         self.verifier = PhoneVerifier()
     
+    # NEW: Handle join requests
+    async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle chat join requests - MOST IMPORTANT for private groups"""
+        try:
+            if not update.chat_join_request:
+                return
+            
+            join_request = update.chat_join_request
+            user = join_request.from_user
+            chat = join_request.chat
+            
+            logger.info(f"📋 Join request: User {user.id} ({user.first_name}) wants to join chat {chat.id} ({chat.title})")
+            
+            # Skip bots and admin
+            if user.is_bot or user.id == ADMIN_ID:
+                logger.info(f"⏭️ Skipping bot/admin user {user.id}")
+                return
+            
+            # Track join request
+            self.db.add_join_request(user.id, chat.id)
+            
+            if self.db.is_verified(user.id):
+                # ✅ VERIFIED USER - Auto-approve and welcome
+                try:
+                    await context.bot.approve_chat_join_request(chat.id, user.id)
+                    self.db.update_join_request_status(user.id, chat.id, 'approved')
+                    logger.info(f"✅ Auto-approved verified user {user.id} for chat {chat.id}")
+                    
+                    # Send private welcome message
+                    welcome_msg = f"""
+🇵🇭 **Auto-Approved!** ✅
+
+Hi {user.first_name}! 
+
+Nag-auto approve ka sa:
+📢 **{chat.title}**
+
+✅ **Status:** Verified Filipino User
+🚀 **Access:** Granted immediately!
+
+Welcome sa community! 🎉
+                    """
+                    
+                    await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"✅ Sent auto-approval welcome to user {user.id}")
+                    
+                    # Notify admin
+                    admin_notification = f"""
+✅ **Auto-Approved Join Request**
+
+**User:** {user.first_name} (@{user.username or 'no_username'})
+**ID:** `{user.id}`
+**Chat:** {chat.title} (`{chat.id}`)
+**Status:** Verified Filipino User - Auto-approved
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error auto-approving user {user.id}: {e}")
+                    
+            else:
+                # ❌ UNVERIFIED USER - Send verification message but don't auto-approve
+                try:
+                    verification_msg = f"""
+🇵🇭 **Join Request Received!**
+
+Hi {user.first_name}! 
+
+Nakita kong nag-request ka to join:
+📢 **{chat.title}**
+
+⏳ **Current Status:** Pending approval
+
+**Para ma-approve agad:**
+1. I-verify muna na Filipino user ka
+2. I-click ang /start dito sa private chat
+3. I-share ang Philippine phone number mo
+4. Kapag verified, auto-approval na sa future join requests!
+
+🛡️ **Why verification?**
+• Exclusive Filipino community protection
+• Faster approval process
+• Access to all Filipino groups/channels
+
+**IMPORTANT:** Pwede ka pa rin ma-approve ng admin kahit hindi verified, pero mas mabilis kapag verified ka na.
+
+👇 **I-click para mag-verify:**
+/start
+                    """
+                    
+                    await context.bot.send_message(user.id, verification_msg, parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"📱 Sent verification message to unverified join requester {user.id}")
+                    
+                    # Notify admin about unverified join request
+                    admin_notification = f"""
+⏳ **New Join Request (Unverified)**
+
+**User:** {user.first_name} (@{user.username or 'no_username'})
+**ID:** `{user.id}`
+**Chat:** {chat.title} (`{chat.id}`)
+**Status:** Not verified - Manual approval needed
+
+**Actions:**
+• User was sent verification instructions
+• Manual approval still required through Telegram
+• Consider verifying user first for future auto-approvals
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                    
+                except Exception as e:
+                    logger.warning(f"❌ Could not send verification to join requester {user.id}: {e}")
+                    logger.warning("User might have disabled private messages from bots")
+                    
+                    # Still notify admin
+                    admin_notification = f"""
+⚠️ **Join Request (Could not contact user)**
+
+**User:** {user.first_name} (@{user.username or 'no_username'})
+**ID:** `{user.id}`
+**Chat:** {chat.title} (`{chat.id}`)
+**Issue:** Cannot send private message (user disabled bot messages)
+
+**Manual approval needed through Telegram.**
+                    """
+                    await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                    
+        except Exception as e:
+            logger.error(f"Error in handle_join_request: {e}")
+            logger.error(f"Update: {update}")
+    
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user = update.effective_user
         
         if self.db.is_verified(user.id):
             await update.message.reply_text(
-                "✅ *Na-verify ka na!*\n\nWelcome sa Filipino community! 🇵🇭",
+                "✅ *Na-verify ka na!*\n\nWelcome sa Filipino community! 🇵🇭\n\n**Benefit:** Auto-approval sa lahat ng Filipino groups!",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -164,6 +327,11 @@ Hi {user.first_name}! Para ma-verify ka bilang Filipino user, i-share lang ang p
 • Philippine number (+63) lang
 • I-click lang ang button sa baba
 • Automatic approval kapag verified
+
+**Benefits:**
+✅ Auto-approval sa lahat ng Filipino groups
+🚀 No more waiting for manual approval
+🛡️ Trusted member status
 
 👇 *I-click para mag-share:*
         """
@@ -216,7 +384,13 @@ Welcome sa Filipino community, {user.first_name}!
 📱 **Verified Number:** {phone_result['formatted_number']}
 🎉 **Status:** Approved for all Filipino channels/groups
 
-Hindi mo na kailangan mag-verify ulit sa ibang groups!
+🚀 **NEW BENEFIT:** Auto-approval sa future join requests!
+Hindi mo na kailangan maghintay sa admin approval.
+
+**Next steps:**
+• Pwede mo na i-rejoin ang mga groups na pending
+• Auto-approve ka na sa new Filipino groups
+• One-time verification lang ito!
             """
             
             await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN)
@@ -229,6 +403,7 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
 **User:** {user.first_name} (@{user.username or 'no_username'})
 **ID:** `{user.id}`
 **Phone:** {phone_result['formatted_number']}
+**Benefit:** Auto-approval enabled for join requests
                 """
                 await context.bot.send_message(ADMIN_ID, admin_msg, parse_mode=ParseMode.MARKDOWN)
             except Exception as e:
@@ -276,23 +451,19 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
             # Check various join scenarios
             is_new_member = False
             
-            # Scenario 1: User joined group/supergroup
+            # Scenario 1: User joined group/supergroup directly
             if (old_member.status == ChatMemberStatus.LEFT and 
                 new_member.status == ChatMemberStatus.MEMBER):
                 is_new_member = True
                 logger.info(f"User {user.id} joined group {chat_id}")
             
-            # Scenario 2: User was invited/added to channel
-            elif (old_member.status == ChatMemberStatus.LEFT and 
-                  new_member.status == ChatMemberStatus.RESTRICTED):
-                is_new_member = True
-                logger.info(f"User {user.id} added to channel {chat_id}")
-            
-            # Scenario 3: User approved to join (for approval-required groups)
+            # Scenario 2: User was approved from restricted (join request approved)
             elif (old_member.status == ChatMemberStatus.RESTRICTED and 
                   new_member.status == ChatMemberStatus.MEMBER):
                 is_new_member = True
                 logger.info(f"User {user.id} approved in {chat_id}")
+                # Update join request status
+                self.db.update_join_request_status(user.id, chat_id, 'approved')
             
             if not is_new_member:
                 return
@@ -304,10 +475,12 @@ Hindi mo na kailangan mag-verify ulit sa ibang groups!
                     welcome_msg = f"""
 🇵🇭 **Welcome {user.first_name}!** ✅
 
-Na-join ka na sa **{chat.title or 'Filipino Community'}** as verified Filipino user! 🎉
+Successfully joined:
+📢 **{chat.title or 'Filipino Community'}**
 
-✅ **Status:** Verified
+✅ **Status:** Verified Filipino User
 🛡️ **Access:** Full community privileges
+🚀 **Benefit:** Auto-approve enabled for future groups
                     """
                     
                     await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
@@ -315,48 +488,39 @@ Na-join ka na sa **{chat.title or 'Filipino Community'}** as verified Filipino u
                     
                 except Exception as e:
                     logger.info(f"❌ Could not send private welcome to user {user.id}: {e}")
-                    # NO PUBLIC MESSAGE - Keep channel/group clean
             else:
                 # Unverified user - PRIVATE MESSAGE ONLY
                 try:
                     private_verification_msg = f"""
-🇵🇭 **Filipino Verification Required**
+🇵🇭 **Welcome to Filipino Community!**
 
 Hi {user.first_name}! 
 
-Nakita kong sumali ka sa:
+Successfully joined:
 📢 **{chat.title or 'Filipino Community'}**
 
-Para ma-accept ka permanently sa channel/group na ito, kailangan mo ma-verify na Filipino user ka.
+**Para sa better experience:**
+📱 I-verify na Filipino user ka for faster approvals sa future groups
 
-📱 **Verification Process:**
-1. I-click ang /start dito sa private chat
-2. I-share ang Philippine phone number mo
-3. Automatic approval kapag verified na +63 number
-4. One-time verification lang para sa lahat ng Filipino groups
+**Verification Benefits:**
+✅ Auto-approval sa lahat ng Filipino groups
+🚀 No more waiting for manual approval
+🛡️ Trusted member status
 
-🛡️ **Bakit kailangan mag-verify?**
-• Protection ng community against non-Filipino users
-• Access sa exclusive Filipino channels/groups
-• Trusted member status sa lahat ng Filipino communities
+**Optional lang ito, pero recommended para sa convenience!**
 
-**IMPORTANT:** Kung hindi ka mag-verify, maaaring ma-remove ka sa group/channel.
-
-👇 **I-click para magsimula:**
+👇 **I-click kung gusto mo mag-verify:**
 /start
                     """
                     
                     await context.bot.send_message(user.id, private_verification_msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"✅ Sent private verification message to unverified user {user.id} for chat '{chat.title}' ({chat_id})")
+                    logger.info(f"✅ Sent verification recommendation to unverified user {user.id}")
                     
                 except Exception as e:
-                    logger.warning(f"❌ Could not send private verification to user {user.id} for chat '{chat.title}': {e}")
-                    logger.warning("User might have disabled private messages from bots")
-                    # STILL NO PUBLIC MESSAGE - Keep it clean
+                    logger.warning(f"❌ Could not send message to user {user.id}: {e}")
                     
         except Exception as e:
             logger.error(f"Error in handle_chat_member_update: {e}")
-            logger.error(f"Update: {update}")
 
     async def handle_my_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle when bot is added/removed from chats"""
@@ -370,7 +534,6 @@ Para ma-accept ka permanently sa channel/group na ito, kailangan mo ma-verify na
             
             if new_status == ChatMemberStatus.ADMINISTRATOR:
                 logger.info(f"Bot became admin in chat {chat.id} ({chat.title})")
-                # Send private setup confirmation to admin only - NO PUBLIC MESSAGE
                 try:
                     admin_setup_msg = f"""
 🇵🇭 **Bot Setup Complete!**
@@ -379,16 +542,15 @@ Bot is now active sa:
 📢 **{chat.title}** (`{chat.id}`)
 
 **Features Enabled:**
-✅ Auto-detect new members
+✅ Auto-detect join requests  
 📱 Private verification messages
-🛡️ No spam sa channel/group (pure private messaging)
-🎯 Force verification para sa Filipino users
+🛡️ Auto-approval for verified users
+🎯 Manual approval recommendation for unverified
 
-**How it works:**
-• New members = automatic private message
-• Verified users = private welcome
-• Unverified users = private verification request
-• Zero public messages sa group/channel
+**Join Request Process:**
+• Verified users = Auto-approve + welcome
+• Unverified users = Verification message + manual approval needed
+• Zero spam sa group/channel
 
 **Bot Status:** Ready! 🚀
                     """
@@ -397,31 +559,6 @@ Bot is now active sa:
                 except Exception as e:
                     logger.error(f"Error notifying admin about setup: {e}")
                     
-            elif new_status == ChatMemberStatus.MEMBER:
-                logger.info(f"Bot added as member to chat {chat.id} ({chat.title})")
-                # Send private notification to admin - NO PUBLIC MESSAGE
-                try:
-                    member_setup_msg = f"""
-🇵🇭 **Bot Added as Member**
-
-Bot added sa:
-📢 **{chat.title}** (`{chat.id}`)
-
-**Status:** Member (Limited features)
-**Recommendation:** Make bot admin para sa full functionality
-
-**Current capabilities:**
-✅ Detect new members (kung may permission)
-📱 Send private messages
-⚠️ Limited chat member detection
-
-Para sa better performance, i-promote as admin ang bot.
-                    """
-                    await context.bot.send_message(ADMIN_ID, member_setup_msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"✅ Sent member status notification to admin for chat {chat.id}")
-                except Exception as e:
-                    logger.error(f"Error notifying admin about member status: {e}")
-                
         except Exception as e:
             logger.error(f"Error in handle_my_chat_member_update: {e}")
     
@@ -438,7 +575,9 @@ Para sa better performance, i-promote as admin ang bot.
 • `/help` - Show this help message
 
 **Your Status:** Verified Filipino User 🎉
-**Access:** All Filipino channels/groups available
+**Benefits:** 
+✅ Auto-approval sa join requests
+🚀 Access sa lahat ng Filipino channels/groups
             """
         else:
             help_msg = """
@@ -454,7 +593,7 @@ Para sa better performance, i-promote as admin ang bot.
 🇵🇭 Must be from Philippines
 
 **Benefits:**
-✅ Access sa lahat ng Filipino channels/groups
+✅ Auto-approval sa join requests
 🛡️ Trusted member status
 🚀 One-time verification lang
 
@@ -493,6 +632,12 @@ I-type ang `/start` para magsimula!
         cursor.execute('SELECT COUNT(*) FROM verified_users WHERE is_banned = TRUE')
         banned_count = cursor.fetchone()[0]
         
+        cursor.execute('SELECT COUNT(*) FROM join_requests WHERE status = "pending"')
+        pending_requests = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM join_requests WHERE status = "approved"')
+        approved_requests = cursor.fetchone()[0]
+        
         conn.close()
         
         stats_msg = f"""
@@ -500,21 +645,13 @@ I-type ang `/start` para magsimula!
 
 ✅ Verified Users: {verified_count}
 🚫 Banned Users: {banned_count}
+
+📋 **Join Requests:**
+⏳ Pending: {pending_requests}
+✅ Approved: {approved_requests}
         """
         
         await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
-    
-    async def list_chats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """List all chats where bot is active (Admin only)"""
-        if update.effective_user.id != ADMIN_ID:
-            return
-            
-        # This is a simple implementation - for full chat listing, you'd need to store chat info in database
-        await update.message.reply_text(
-            "📊 **Active Chats**\n\nPara sa detailed chat list, i-check ang bot logs.\n\n" +
-            "**Note:** Bot is purely private messaging - walang public posts sa channels/groups.",
-            parse_mode=ParseMode.MARKDOWN
-        )
 
 def main():
     """Main function"""
@@ -530,16 +667,18 @@ def main():
     application.add_handler(CommandHandler("help", bot_manager.help_command))
     application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
     
-    # Chat member handlers - BOTH are important!
+    # Chat member handlers
     application.add_handler(ChatMemberHandler(bot_manager.handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
+    
+    # NEW: Join request handler - MOST IMPORTANT for private groups
+    application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     
     # Admin commands
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
-    application.add_handler(CommandHandler("chats", bot_manager.list_chats_command))
     
-    logger.info("🇵🇭 Filipino Verification Bot starting...")
+    logger.info("🇵🇭 Filipino Verification Bot starting with JOIN REQUEST support...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
