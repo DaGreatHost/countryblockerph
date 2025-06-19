@@ -27,9 +27,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration - Use environment variables for security
+# Configuration - Use environment variables for security with default values
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+
+# Optional environment variables with defaults
+REQUIRED_CHANNEL_ID = os.getenv('REQUIRED_CHANNEL_ID')
+if REQUIRED_CHANNEL_ID:
+    try:
+        REQUIRED_CHANNEL_ID = int(REQUIRED_CHANNEL_ID)
+    except ValueError:
+        logger.error(f"Invalid REQUIRED_CHANNEL_ID: {REQUIRED_CHANNEL_ID}. Must be a number.")
+        REQUIRED_CHANNEL_ID = None
+else:
+    REQUIRED_CHANNEL_ID = None
 
 # Filipino language patterns
 FILIPINO_PATTERNS = [
@@ -326,6 +337,23 @@ Para sa mga tanong, makipag-ugnayan sa admin.
         """
         
         await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    
+    async def verify_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /verify command"""
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+        
+        # Check if user is already verified
+        user_data = self.db.get_user(user.id)
+        if user_data and user_data.verification_status == "verified":
+            await update.message.reply_text(
+                "✅ You are already verified! No need to verify again.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Start verification process
+        await self.start_verification_process(user, chat_id, context)
     
     async def verify_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Verify new chat members"""
@@ -763,117 +791,4 @@ Salamat sa pagiging verified Filipino user! 🚀
             if strikes >= 3:
                 await self.auto_ban_user(user_id, "Multiple non-PH phone number attempts", context)
     
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /status command"""
-        user_id = update.effective_user.id
-        user_data = self.db.get_user(user_id)
-        
-        if not user_data:
-            await update.message.reply_text("❌ No verification data found. Please join a protected chat first.")
-            return
-        
-        status_msg = f"""
-📊 *Your Verification Status*
-
-**User Info:**
-• Name: {user_data.first_name}
-• Status: {user_data.verification_status.upper()}
-• Strikes: {user_data.strike_count}/3
-• Whitelisted: {'Yes' if user_data.is_whitelisted else 'No'}
-• Join Date: {user_data.join_date.strftime('%Y-%m-%d %H:%M')}
-
-**Phone:** {user_data.phone_number or 'Not provided'}
-        """
-        
-        await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
-    
-    # Admin Commands
-    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /stats command (admin only)"""
-        if update.effective_user.id != ADMIN_ID:
-            await update.message.reply_text("❌ Admin access required!")
-            return
-        
-        conn = sqlite3.connect(self.db.db_path)
-        cursor = conn.cursor()
-        
-        # Get statistics
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total_users = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM users WHERE verification_status = 'verified'")
-        verified_users = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM users WHERE verification_status = 'pending'")
-        pending_users = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM banned_users")
-        banned_users = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM users WHERE is_whitelisted = 1")
-        whitelisted_users = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        stats_msg = f"""
-📈 *Bot Statistics*
-
-**Users:**
-• Total: {total_users}
-• Verified: {verified_users}
-• Pending: {pending_users}
-• Banned: {banned_users}
-• Whitelisted: {whitelisted_users}
-
-**Verification Rate:** {(verified_users/total_users*100):.1f}% if total_users > 0 else 0
-        """
-        
-        await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
-
-def main():
-    """Main function to run the bot"""
-    # Validate environment variables
-    if not BOT_TOKEN:
-        print("❌ Error: BOT_TOKEN environment variable is required!")
-        print("Set it in Railway: BOT_TOKEN=your_bot_token_here")
-        return
-    
-    if not ADMIN_ID:
-        print("❌ Error: ADMIN_ID environment variable is required!")
-        print("Set it in Railway: ADMIN_ID=your_admin_user_id")
-        return
-    
-    # Create bot manager
-    bot_manager = FilipinoBotManager()
-    
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", bot_manager.start_command))
-    application.add_handler(CommandHandler("help", bot_manager.help_command))
-    application.add_handler(CommandHandler("status", bot_manager.status_command))
-    application.add_handler(CommandHandler("stats", bot_manager.stats_command))
-    
-    # Chat member handler for new joins
-    application.add_handler(ChatMemberHandler(
-        bot_manager.verify_new_member, 
-        ChatMemberHandler.CHAT_MEMBER
-    ))
-    
-    # Callback query handler
-    application.add_handler(CallbackQueryHandler(bot_manager.handle_callback_query))
-    
-    # Contact message handler
-    application.add_handler(MessageHandler(
-        filters.CONTACT, 
-        bot_manager.handle_contact_message
-    ))
-    
-    # Start the bot
-    print("🤖 Filipino Verification Bot starting...")
-    print(f"👤 Admin ID: {ADMIN_ID}")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == '__main__':
-    main()
+    async
