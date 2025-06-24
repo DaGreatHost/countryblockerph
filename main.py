@@ -58,6 +58,16 @@ class DatabaseManager:
             )
         ''')
         
+        # 🔔 NEW: Reminder notifications tracking table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reminder_notifications (
+                user_id INTEGER PRIMARY KEY,
+                first_reminder_date TIMESTAMP,
+                reminder_count INTEGER DEFAULT 0,
+                last_activity_date TIMESTAMP
+            )
+        ''')
+        
         conn.commit()
         conn.close()
     
@@ -106,6 +116,43 @@ class DatabaseManager:
             SET status = ? 
             WHERE user_id = ? AND chat_id = ?
         ''', (status, user_id, chat_id))
+        conn.commit()
+        conn.close()
+    
+    # 🔔 NEW: Reminder system methods
+    def has_received_reminder(self, user_id: int) -> bool:
+        """Check if user has received a reminder before"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM reminder_notifications WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    
+    def add_reminder_notification(self, user_id: int):
+        """Add reminder notification record"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO reminder_notifications 
+            (user_id, first_reminder_date, reminder_count, last_activity_date)
+            VALUES (?, ?, 1, ?)
+        ''', (user_id, datetime.now(), datetime.now()))
+        conn.commit()
+        conn.close()
+    
+    def update_user_activity(self, user_id: int):
+        """Update user's last activity"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO reminder_notifications 
+            (user_id, first_reminder_date, reminder_count, last_activity_date)
+            VALUES (?, 
+                    COALESCE((SELECT first_reminder_date FROM reminder_notifications WHERE user_id = ?), ?),
+                    COALESCE((SELECT reminder_count FROM reminder_notifications WHERE user_id = ?), 0),
+                    ?)
+        ''', (user_id, user_id, datetime.now(), user_id, datetime.now()))
         conn.commit()
         conn.close()
 
@@ -183,6 +230,8 @@ class FilipinoBotManager:
             
             # Track join request
             self.db.add_join_request(user.id, chat.id)
+            # Update user activity
+            self.db.update_user_activity(user.id)
             
             if self.db.is_verified(user.id):
                 # ✅ VERIFIED USER - Auto-approve and welcome
@@ -225,8 +274,49 @@ Welcome sa community! 🎉
                     
             else:
                 # ❌ UNVERIFIED USER - Send verification message but don't auto-approve
+                # 🔔 Check if this is first-time reminder
+                is_first_reminder = not self.db.has_received_reminder(user.id)
+                
                 try:
-                    verification_msg = f"""
+                    if is_first_reminder:
+                        # 🔔 ENHANCED REMINDER MESSAGE - First time only
+                        verification_msg = f"""
+🔔 **REMINDER: Join Request Received!**
+
+Hi {user.first_name}! 
+
+Nakita kong nag-request ka to join:
+📢 **{chat.title}**
+
+⏳ **Current Status:** Pending approval
+
+🔔 **ONE-TIME REMINDER:** Para sa mas mabilis na approval sa future, mag-verify ka na bilang Filipino user!
+
+**Benefits ng Verification:**
+✅ **Auto-approval** sa lahat ng Filipino groups
+🚀 **No more waiting** for manual approval
+🛡️ **Trusted member status**
+📱 **One-time process lang**
+
+**Paano mag-verify:**
+1. I-click ang /start dito sa private chat
+2. I-share ang Philippine phone number mo
+3. Instant verification!
+
+**IMPORTANT:** Pwede ka pa rin ma-approve ng admin kahit hindi verified, pero mas convenient kapag verified ka na.
+
+*Hindi ka na makakatanggap ng reminder na ito ulit.*
+
+👇 **I-click para mag-verify ngayon:**
+/start
+                        """
+                        
+                        # Mark reminder as sent
+                        self.db.add_reminder_notification(user.id)
+                        logger.info(f"🔔 Sent FIRST-TIME reminder to user {user.id}")
+                    else:
+                        # Regular message for repeat users
+                        verification_msg = f"""
 🇵🇭 **Join Request Received!**
 
 Hi {user.first_name}! 
@@ -236,25 +326,24 @@ Nakita kong nag-request ka to join:
 
 ⏳ **Current Status:** Pending approval
 
-**Para ma-approve agad:**
-1. I-verify muna na Filipino user ka
-2. I-click ang /start dito sa private chat
-3. I-share ang Philippine phone number mo
-4. Kapag verified, auto-approval na sa future join requests!
+**Para ma-approve agad sa future:**
+• Mag-verify ka na bilang Filipino user
+• I-click ang /start dito sa private chat
+• I-share ang Philippine phone number mo
 
-🛡️ **Why verification?**
-• Exclusive Filipino community protection
-• Faster approval process
-• Access to all Filipino groups/channels
+**Benefits:**
+✅ Auto-approval sa Filipino groups
+🚀 Mas mabilis na process
+🛡️ Trusted member status
 
-**IMPORTANT:** Pwede ka pa rin ma-approve ng admin kahit hindi verified, pero mas mabilis kapag verified ka na.
+**IMPORTANT:** Pwede ka pa rin ma-approve ng admin kahit hindi verified.
 
-👇 **I-click para mag-verify:**
+👇 **I-click kung gusto mag-verify:**
 /start
-                    """
+                        """
+                        logger.info(f"📱 Sent regular verification message to repeat user {user.id}")
                     
                     await context.bot.send_message(user.id, verification_msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"📱 Sent verification message to unverified join requester {user.id}")
                     
                     # Notify admin about unverified join request
                     admin_notification = f"""
@@ -264,6 +353,7 @@ Nakita kong nag-request ka to join:
 **ID:** `{user.id}`
 **Chat:** {chat.title} (`{chat.id}`)
 **Status:** Not verified - Manual approval needed
+**Reminder:** {'First-time sent 🔔' if is_first_reminder else 'Repeat user (no reminder)'}
 
 **Actions:**
 • User was sent verification instructions
@@ -296,6 +386,9 @@ Nakita kong nag-request ka to join:
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
         user = update.effective_user
+        
+        # Update user activity
+        self.db.update_user_activity(user.id)
         
         if self.db.is_verified(user.id):
             await update.message.reply_text(
@@ -349,6 +442,9 @@ Hi {user.first_name}! Para ma-verify ka bilang Filipino user, i-share lang ang p
         
         contact = update.message.contact
         user = update.effective_user
+        
+        # Update user activity
+        self.db.update_user_activity(user.id)
         
         # Security check
         if contact.user_id != user.id:
@@ -427,7 +523,7 @@ Hindi mo na kailangan maghintay sa admin approval.
             await update.message.reply_text(fail_msg, parse_mode=ParseMode.MARKDOWN)
     
     async def handle_chat_member_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle new members joining chat - Enhanced version"""
+        """Handle new members joining chat - Enhanced version with reminder system"""
         try:
             if not update.chat_member:
                 logger.info("No chat_member in update")
@@ -447,6 +543,9 @@ Hindi mo na kailangan maghintay sa admin approval.
             if user.is_bot or user.id == ADMIN_ID:
                 logger.info(f"Skipping bot/admin user {user.id}")
                 return
+            
+            # Update user activity
+            self.db.update_user_activity(user.id)
             
             # Check various join scenarios
             is_new_member = False
@@ -489,9 +588,48 @@ Successfully joined:
                 except Exception as e:
                     logger.info(f"❌ Could not send private welcome to user {user.id}: {e}")
             else:
-                # Unverified user - PRIVATE MESSAGE ONLY
+                # Unverified user - PRIVATE MESSAGE with reminder system
+                # 🔔 Check if this is first-time reminder
+                is_first_reminder = not self.db.has_received_reminder(user.id)
+                
                 try:
-                    private_verification_msg = f"""
+                    if is_first_reminder:
+                        # 🔔 ENHANCED MESSAGE for first-time users
+                        private_verification_msg = f"""
+🔔 **Welcome to Filipino Community!**
+
+Hi {user.first_name}! 
+
+Successfully joined:
+📢 **{chat.title or 'Filipino Community'}**
+
+🔔 **ONE-TIME REMINDER:** Para sa better experience at mas mabilis na approvals sa future groups, i-verify na Filipino user ka!
+
+**Verification Benefits:**
+✅ **Auto-approval** sa lahat ng Filipino groups
+🚀 **No more waiting** for manual approval
+🛡️ **Trusted member status**
+📱 **One-time process lang**
+
+**Paano mag-verify:**
+1. I-click ang /start dito
+2. I-share ang Philippine phone number mo
+3. Instant verification!
+
+**Optional lang ito, pero highly recommended para sa convenience!**
+
+*Hindi ka na makakatanggap ng reminder na ito ulit.*
+
+👇 **I-click kung gusto mo mag-verify ngayon:**
+/start
+                        """
+                        
+                        # Mark reminder as sent
+                        self.db.add_reminder_notification(user.id)
+                        logger.info(f"🔔 Sent FIRST-TIME group join reminder to user {user.id}")
+                    else:
+                        # Regular message for repeat users
+                        private_verification_msg = f"""
 🇵🇭 **Welcome to Filipino Community!**
 
 Hi {user.first_name}! 
@@ -511,10 +649,10 @@ Successfully joined:
 
 👇 **I-click kung gusto mo mag-verify:**
 /start
-                    """
+                        """
+                        logger.info(f"📱 Sent regular verification message to repeat user {user.id}")
                     
                     await context.bot.send_message(user.id, private_verification_msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"✅ Sent verification recommendation to unverified user {user.id}")
                     
                 except Exception as e:
                     logger.warning(f"❌ Could not send message to user {user.id}: {e}")
@@ -546,11 +684,13 @@ Bot is now active sa:
 📱 Private verification messages
 🛡️ Auto-approval for verified users
 🎯 Manual approval recommendation for unverified
+🔔 Smart reminder system (one-time per user)
 
 **Join Request Process:**
 • Verified users = Auto-approve + welcome
 • Unverified users = Verification message + manual approval needed
-• Zero spam sa group/channel
+• First-time unverified = Enhanced reminder with 🔔
+• Repeat unverified = Regular message (no spam)
 
 **Bot Status:** Ready! 🚀
                     """
@@ -565,6 +705,9 @@ Bot is now active sa:
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Help command - Show verification instructions"""
         user = update.effective_user
+        
+        # Update user activity
+        self.db.update_user_activity(user.id)
         
         if self.db.is_verified(user.id):
             help_msg = """
@@ -619,13 +762,14 @@ I-type ang `/start` para magsimula!
             await update.message.reply_text("❌ Invalid user ID")
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show stats (Admin only)"""
+        """Show stats (Admin only) - Enhanced with reminder stats"""
         if update.effective_user.id != ADMIN_ID:
             return
             
         conn = sqlite3.connect(self.db.db_path)
         cursor = conn.cursor()
         
+        # Basic stats
         cursor.execute('SELECT COUNT(*) FROM verified_users WHERE is_banned = FALSE')
         verified_count = cursor.fetchone()[0]
         
@@ -638,48 +782,93 @@ I-type ang `/start` para magsimula!
         cursor.execute('SELECT COUNT(*) FROM join_requests WHERE status = "approved"')
         approved_requests = cursor.fetchone()[0]
         
+        # 🔔 NEW: Reminder stats
+        cursor.execute('SELECT COUNT(*) FROM reminder_notifications')
+        total_reminders_sent = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM reminder_notifications WHERE first_reminder_date IS NOT NULL')
+        users_with_reminders = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM reminder_notifications WHERE last_activity_date > datetime("now", "-7 days")')
+        active_users_week = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM reminder_notifications WHERE last_activity_date > datetime("now", "-30 days")')
+        active_users_month = cursor.fetchone()[0]
+        
         conn.close()
         
         stats_msg = f"""
-📊 **Bot Stats**
+📊 **Filipino Bot Statistics**
 
-✅ Verified Users: {verified_count}
-🚫 Banned Users: {banned_count}
+**👥 User Stats:**
+✅ Verified Users: `{verified_count}`
+🚫 Banned Users: `{banned_count}`
+👤 Total Registered: `{verified_count + banned_count}`
 
-📋 **Join Requests:**
-⏳ Pending: {pending_requests}
-✅ Approved: {approved_requests}
+**📋 Join Request Stats:**
+⏳ Pending Requests: `{pending_requests}`
+✅ Approved Requests: `{approved_requests}`
+📊 Total Requests: `{pending_requests + approved_requests}`
+
+**🔔 Reminder System Stats:**
+📨 Total Reminders Sent: `{total_reminders_sent}`
+👥 Users Who Received Reminders: `{users_with_reminders}`
+🔥 Active Users (7 days): `{active_users_week}`
+📈 Active Users (30 days): `{active_users_month}`
+
+**💡 System Performance:**
+• One-time reminder per user ✅
+• Smart spam prevention ✅
+• Activity tracking enabled ✅
+• Auto-approval for verified users ✅
+
+Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
         """
         
         await update.message.reply_text(stats_msg, parse_mode=ParseMode.MARKDOWN)
+    
+    async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Handle errors"""
+        logger.error(f"Exception while handling update: {context.error}")
+        logger.error(f"Update: {update}")
 
 def main():
-    """Main function"""
-    if not BOT_TOKEN or not ADMIN_ID:
-        logger.error("BOT_TOKEN and ADMIN_ID environment variables are required!")
-        return
-    
+    """Start the bot"""
     bot_manager = FilipinoBotManager()
+    
+    # Create application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", bot_manager.start_command))
     application.add_handler(CommandHandler("help", bot_manager.help_command))
-    application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
-    
-    # Chat member handlers
-    application.add_handler(ChatMemberHandler(bot_manager.handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-    application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
-    
-    # NEW: Join request handler - MOST IMPORTANT for private groups
-    application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
-    
-    # Admin commands
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
     
-    logger.info("🇵🇭 Filipino Verification Bot starting with JOIN REQUEST support...")
+    # Handle phone number verification
+    application.add_handler(MessageHandler(filters.CONTACT, bot_manager.handle_contact_message))
+    
+    # Handle join requests (MOST IMPORTANT for private groups)
+    application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
+    
+    # Handle chat member updates (when users join groups)
+    application.add_handler(ChatMemberHandler(bot_manager.handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    
+    # Handle bot being added to chats
+    application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
+    
+    # Error handler
+    application.add_error_handler(bot_manager.error_handler)
+    
+    # Start bot
+    logger.info("🇵🇭 Filipino Bot started!")
+    logger.info("🔔 New Reminder Features Added:")
+    logger.info("✅ One-time reminder system enabled")
+    logger.info("✅ Smart spam prevention active")
+    logger.info("✅ Activity tracking enabled")
+    logger.info("✅ Enhanced messaging for first-time users")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
