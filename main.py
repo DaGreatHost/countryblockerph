@@ -117,16 +117,12 @@ class PhoneVerifier:
             # Handle common PH number formats
             cleaned_number = phone_number.replace(" ", "").replace("-", "")
             
-            # If number starts with 09, convert to +639
             if cleaned_number.startswith("09"):
                 cleaned_number = "+63" + cleaned_number[1:]
-            # If number starts with 9, convert to +639
             elif cleaned_number.startswith("9") and len(cleaned_number) == 10:
                 cleaned_number = "+63" + cleaned_number
-            # If number starts with 63, add +
             elif cleaned_number.startswith("63") and not cleaned_number.startswith("+63"):
                 cleaned_number = "+" + cleaned_number
-            # If number doesn't have country code, assume PH
             elif not cleaned_number.startswith("+") and len(cleaned_number) == 10:
                 cleaned_number = "+63" + cleaned_number[1:] if cleaned_number.startswith("0") else "+63" + cleaned_number
             
@@ -176,12 +172,10 @@ class FilipinoBotManager:
             
             logger.info(f"📋 Join request: User {user.id} ({user.first_name}) wants to join chat {chat.id} ({chat.title})")
             
-            # Skip bots and admin
             if user.is_bot or user.id == ADMIN_ID:
                 logger.info(f"⏭️ Skipping bot/admin user {user.id}")
                 return
             
-            # Track join request
             self.db.add_join_request(user.id, chat.id)
             
             if self.db.is_verified(user.id):
@@ -191,7 +185,6 @@ class FilipinoBotManager:
                     self.db.update_join_request_status(user.id, chat.id, 'approved')
                     logger.info(f"✅ Auto-approved verified user {user.id} for chat {chat.id}")
                     
-                    # Send private welcome message
                     welcome_msg = f"""
 🇵🇭 **Auto-Approved!** ✅
 
@@ -209,7 +202,6 @@ Welcome sa community! 🎉
                     await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"✅ Sent auto-approval welcome to user {user.id}")
                     
-                    # Notify admin
                     admin_notification = f"""
 ✅ **Auto-Approved Join Request**
 
@@ -224,7 +216,7 @@ Welcome sa community! 🎉
                     logger.error(f"❌ Error auto-approving user {user.id}: {e}")
                     
             else:
-                # ❌ UNVERIFIED USER - Send verification message but don't auto-approve
+                # ❌ UNVERIFIED USER - Send verification message and schedule a reminder
                 try:
                     verification_msg = f"""
 🇵🇭 **Join Request Received!**
@@ -242,11 +234,6 @@ Nakita kong nag-request ka to join:
 3. I-share ang Philippine phone number mo
 4. Kapag verified, auto-approval na sa future join requests!
 
-🛡️ **Why verification?**
-• Exclusive Filipino community protection
-• Faster approval process
-• Access to all Filipino groups/channels
-
 **IMPORTANT:** Pwede ka pa rin ma-approve ng admin kahit hindi verified, pero mas mabilis kapag verified ka na.
 
 👇 **I-click para mag-verify:**
@@ -256,7 +243,25 @@ Nakita kong nag-request ka to join:
                     await context.bot.send_message(user.id, verification_msg, parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"📱 Sent verification message to unverified join requester {user.id}")
                     
-                    # Notify admin about unverified join request
+                    # --- START OF REMINDER SCHEDULING CODE ---
+                    reminder_delay_seconds = 86400  # 24 hours
+                    
+                    job_context_data = {
+                        'user_id': user.id,
+                        'chat_id': chat.id,
+                        'chat_title': chat.title,
+                        'user_first_name': user.first_name
+                    }
+
+                    context.job_queue.run_once(
+                        self.send_verification_reminder, 
+                        reminder_delay_seconds, 
+                        data=job_context_data,
+                        name=f"reminder_{user.id}_{chat.id}"
+                    )
+                    logger.info(f"⏰ Reminder scheduled for user {user.id} in {reminder_delay_seconds} seconds.")
+                    # --- END OF REMINDER SCHEDULING CODE ---
+                    
                     admin_notification = f"""
 ⏳ **New Join Request (Unverified)**
 
@@ -265,33 +270,79 @@ Nakita kong nag-request ka to join:
 **Chat:** {chat.title} (`{chat.id}`)
 **Status:** Not verified - Manual approval needed
 
-**Actions:**
-• User was sent verification instructions
-• Manual approval still required through Telegram
-• Consider verifying user first for future auto-approvals
+**Action:** User has been sent verification instructions via private message. A reminder is scheduled in 24 hours.
                     """
                     await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
                     
                 except Exception as e:
                     logger.warning(f"❌ Could not send verification to join requester {user.id}: {e}")
-                    logger.warning("User might have disabled private messages from bots")
-                    
-                    # Still notify admin
-                    admin_notification = f"""
+                    admin_notification_fail = f"""
 ⚠️ **Join Request (Could not contact user)**
 
 **User:** {user.first_name} (@{user.username or 'no_username'})
 **ID:** `{user.id}`
 **Chat:** {chat.title} (`{chat.id}`)
-**Issue:** Cannot send private message (user disabled bot messages)
+**Issue:** Cannot send private message (user might have blocked the bot).
 
 **Manual approval needed through Telegram.**
                     """
-                    await context.bot.send_message(ADMIN_ID, admin_notification, parse_mode=ParseMode.MARKDOWN)
+                    await context.bot.send_message(ADMIN_ID, admin_notification_fail, parse_mode=ParseMode.MARKDOWN)
                     
         except Exception as e:
             logger.error(f"Error in handle_join_request: {e}")
             logger.error(f"Update: {update}")
+
+    # <<< START OF NEW FUNCTION >>>
+    async def send_verification_reminder(self, context: ContextTypes.DEFAULT_TYPE):
+        """Nagpapadala ng reminder sa user na hindi pa nag-ve-verify. Ito ay laging via private message."""
+        job = context.job
+        user_id = job.data['user_id']
+        chat_id = job.data['chat_id']
+        chat_title = job.data['chat_title']
+        user_first_name = job.data['user_first_name']
+        
+        # Check muna kung ang user ay na-handle na (approved/denied) o na-verify na.
+        if self.db.is_verified(user_id):
+            logger.info(f"⏰ Reminder for user {user_id} cancelled: User is now verified.")
+            return
+            
+        conn = sqlite3.connect(self.db.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM join_requests WHERE user_id = ? AND chat_id = ? AND status = 'pending'", (user_id, chat_id))
+        is_still_pending = cursor.fetchone()
+        conn.close()
+        
+        if not is_still_pending:
+            logger.info(f"⏰ Reminder for user {user.id} in chat {chat_id} cancelled: Join request is no longer pending.")
+            return
+
+        # Kung hindi pa rin verified at pending pa rin, ipapadala ang private reminder.
+        logger.info(f"⏰ Sending verification reminder to user {user_id} for chat {chat_id}")
+        
+        reminder_msg = f"""
+👋 **Reminder Lang Po!**
+
+Hi {user_first_name}!
+
+Nakita namin na may pending join request ka pa rin para sa:
+📢 **{chat_title}**
+
+Para ma-approve, kailangan mo lang i-verify ang iyong Philippine phone number sa pamamagitan ng private chat sa akin.
+
+**Bakit importante?**
+✅ Para ma-auto-approve ka sa mga susunod na request.
+🚀 Mabilis na access sa group.
+🛡️ Pinapanatili nating exclusive sa mga Pinoy ang community.
+
+👇 **I-click para magsimula ng verification:**
+/start
+        """
+        try:
+            await context.bot.send_message(user_id, reminder_msg, parse_mode=ParseMode.MARKDOWN)
+            logger.info(f"⏰ Reminder sent successfully to user {user_id}")
+        except Exception as e:
+            logger.warning(f"❌ Could not send reminder to user {user.id}. Maaaring blinock niya ang bot. Error: {e}")
+    # <<< END OF NEW FUNCTION >>>
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -304,7 +355,6 @@ Nakita kong nag-request ka to join:
             )
             return
         
-        # Start verification process immediately
         await self.start_verification(update, context)
     
     async def start_verification(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -350,7 +400,6 @@ Hi {user.first_name}! Para ma-verify ka bilang Filipino user, i-share lang ang p
         contact = update.message.contact
         user = update.effective_user
         
-        # Security check
         if contact.user_id != user.id:
             await update.message.reply_text(
                 "❌ Sariling phone number mo lang ang pwedeng i-verify!",
@@ -358,17 +407,14 @@ Hi {user.first_name}! Para ma-verify ka bilang Filipino user, i-share lang ang p
             )
             return
         
-        # Remove keyboard
         await update.message.reply_text(
             "📱 Ini-verify ang phone number...",
             reply_markup=ReplyKeyboardRemove()
         )
         
-        # Verify phone number
         phone_result = self.verifier.verify_phone_number(contact.phone_number)
         
         if phone_result['is_filipino']:
-            # SUCCESS - Add to verified users
             self.db.add_verified_user(
                 user.id, 
                 user.username, 
@@ -395,7 +441,6 @@ Hindi mo na kailangan maghintay sa admin approval.
             
             await update.message.reply_text(success_msg, parse_mode=ParseMode.MARKDOWN)
             
-            # Notify admin
             try:
                 admin_msg = f"""
 ✅ *New Verified User*
@@ -409,7 +454,6 @@ Hindi mo na kailangan maghintay sa admin approval.
             except Exception as e:
                 logger.error(f"Error notifying admin: {e}")
         else:
-            # FAILED
             country_info = phone_result.get('region', 'Unknown')
             fail_msg = f"""
 ❌ **Hindi Philippine Number**
@@ -430,9 +474,8 @@ Hindi mo na kailangan maghintay sa admin approval.
         """Handle new members joining chat - Enhanced version"""
         try:
             if not update.chat_member:
-                logger.info("No chat_member in update")
                 return
-                
+            
             chat_member_update = update.chat_member
             new_member = chat_member_update.new_chat_member
             old_member = chat_member_update.old_chat_member
@@ -440,35 +483,22 @@ Hindi mo na kailangan maghintay sa admin approval.
             chat_id = update.effective_chat.id
             chat = update.effective_chat
             
-            logger.info(f"Chat member update: User {user.id} ({user.first_name}) in chat {chat_id}")
-            logger.info(f"Old status: {old_member.status}, New status: {new_member.status}")
+            logger.info(f"Chat member update: User {user.id} in chat {chat_id}. Old status: {old_member.status}, New status: {new_member.status}")
             
-            # Skip bots and admin
             if user.is_bot or user.id == ADMIN_ID:
-                logger.info(f"Skipping bot/admin user {user.id}")
                 return
             
-            # Check various join scenarios
-            is_new_member = False
+            is_new_join = (
+                (old_member.status in [ChatMemberStatus.LEFT, ChatMemberStatus.BANNED] and new_member.status == ChatMemberStatus.MEMBER) or
+                (old_member.status == ChatMemberStatus.RESTRICTED and new_member.status == ChatMemberStatus.MEMBER)
+            )
             
-            # Scenario 1: User joined group/supergroup directly
-            if (old_member.status == ChatMemberStatus.LEFT and 
-                new_member.status == ChatMemberStatus.MEMBER):
-                is_new_member = True
-                logger.info(f"User {user.id} joined group {chat_id}")
-            
-            # Scenario 2: User was approved from restricted (join request approved)
-            elif (old_member.status == ChatMemberStatus.RESTRICTED and 
-                  new_member.status == ChatMemberStatus.MEMBER):
-                is_new_member = True
-                logger.info(f"User {user.id} approved in {chat_id}")
-                # Update join request status
-                self.db.update_join_request_status(user.id, chat_id, 'approved')
-            
-            if not is_new_member:
+            if not is_new_join:
                 return
+
+            # Update join request status upon successful join
+            self.db.update_join_request_status(user.id, chat_id, 'approved')
             
-            # Check if user is verified  
             if self.db.is_verified(user.id):
                 # Verified user - send private welcome message only
                 try:
@@ -485,7 +515,6 @@ Successfully joined:
                     
                     await context.bot.send_message(user.id, welcome_msg, parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"✅ Sent private welcome to verified user {user.id} for chat {chat_id}")
-                    
                 except Exception as e:
                     logger.info(f"❌ Could not send private welcome to user {user.id}: {e}")
             else:
@@ -515,10 +544,8 @@ Successfully joined:
                     
                     await context.bot.send_message(user.id, private_verification_msg, parse_mode=ParseMode.MARKDOWN)
                     logger.info(f"✅ Sent verification recommendation to unverified user {user.id}")
-                    
                 except Exception as e:
                     logger.warning(f"❌ Could not send message to user {user.id}: {e}")
-                    
         except Exception as e:
             logger.error(f"Error in handle_chat_member_update: {e}")
 
@@ -527,7 +554,7 @@ Successfully joined:
         try:
             if not update.my_chat_member:
                 return
-                
+            
             chat_member_update = update.my_chat_member
             new_status = chat_member_update.new_chat_member.status
             chat = update.effective_chat
@@ -542,8 +569,8 @@ Bot is now active sa:
 📢 **{chat.title}** (`{chat.id}`)
 
 **Features Enabled:**
-✅ Auto-detect join requests  
-📱 Private verification messages
+✅ Auto-detect join requests
+📱 Private verification messages (with reminders)
 🛡️ Auto-approval for verified users
 🎯 Manual approval recommendation for unverified
 
@@ -555,10 +582,8 @@ Bot is now active sa:
 **Bot Status:** Ready! 🚀
                     """
                     await context.bot.send_message(ADMIN_ID, admin_setup_msg, parse_mode=ParseMode.MARKDOWN)
-                    logger.info(f"✅ Sent private setup confirmation to admin for chat {chat.id}")
                 except Exception as e:
                     logger.error(f"Error notifying admin about setup: {e}")
-                    
         except Exception as e:
             logger.error(f"Error in handle_my_chat_member_update: {e}")
     
@@ -575,8 +600,7 @@ Bot is now active sa:
 • `/help` - Show this help message
 
 **Your Status:** Verified Filipino User 🎉
-**Benefits:** 
-✅ Auto-approval sa join requests
+**Benefits:** ✅ Auto-approval sa join requests
 🚀 Access sa lahat ng Filipino channels/groups
             """
         else:
@@ -587,10 +611,6 @@ Bot is now active sa:
 1. I-type ang `/start` 
 2. I-click ang "Share Phone Number" button
 3. Automatic approval kapag Philippine number (+63)
-
-**Requirements:**
-📱 Valid Philippine mobile number
-🇵🇭 Must be from Philippines
 
 **Benefits:**
 ✅ Auto-approval sa join requests
@@ -671,14 +691,14 @@ def main():
     application.add_handler(ChatMemberHandler(bot_manager.handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     application.add_handler(ChatMemberHandler(bot_manager.handle_my_chat_member_update, ChatMemberHandler.MY_CHAT_MEMBER))
     
-    # NEW: Join request handler - MOST IMPORTANT for private groups
+    # Join request handler - MOST IMPORTANT for private groups
     application.add_handler(ChatJoinRequestHandler(bot_manager.handle_join_request))
     
     # Admin commands
     application.add_handler(CommandHandler("ban", bot_manager.ban_command))
     application.add_handler(CommandHandler("stats", bot_manager.stats_command))
     
-    logger.info("🇵🇭 Filipino Verification Bot starting with JOIN REQUEST support...")
+    logger.info("🇵🇭 Filipino Verification Bot starting with JOIN REQUEST and REMINDER support...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
